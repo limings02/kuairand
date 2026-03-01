@@ -1,0 +1,10 @@
+﻿file,selected,reason
+random_vs_standard_concentration.png,1,main deck
+log_standard_tab_ctr.png,1,main deck
+log_random_tab_ctr.png,1,main deck
+log_standard_user_exposure_hist.png,1,main deck
+log_standard_video_long_tail_loglog.png,1,main deck
+log_random_video_long_tail_loglog.png,1,main deck
+video_basic_type_ratio.png,1,main deck
+video_statistic_corr_exposure_top15.png,1,main deck
+join_success_compare.png,1,derived from join tables

@@ -1,0 +1,11 @@
+﻿file_path,file_name,row_count,col_count,candidate_keys,best_key,best_key_duplicate_ratio,is_monotonic_user_time,monotonic_violation_count
+KuaiRand-27K\KuaiRand-27K\data\log_random_4_22_to_5_08_27k.csv,log_random_4_22_to_5_08_27k.csv,1186059,19,"user_id+time_ms,video_id+time_ms,user_id+video_id+time_ms,user_id,video_id",user_id+time_ms,8.431283772591947e-06,True,0.0
+KuaiRand-27K\KuaiRand-27K\data\log_standard_4_08_to_4_21_27k_part1.csv,log_standard_4_08_to_4_21_27k_part1.csv,68148288,19,"user_id+time_ms,video_id+time_ms,user_id+video_id+time_ms,user_id,video_id",user_id+video_id+time_ms,0.006336109279810542,True,0.0
+KuaiRand-27K\KuaiRand-27K\data\log_standard_4_08_to_4_21_27k_part2.csv,log_standard_4_08_to_4_21_27k_part2.csv,68148288,19,"user_id+time_ms,video_id+time_ms,user_id+video_id+time_ms,user_id,video_id",user_id+video_id+time_ms,0.006306673470652724,True,0.0
+KuaiRand-27K\KuaiRand-27K\data\log_standard_4_22_to_5_08_27k_part1.csv,log_standard_4_22_to_5_08_27k_part1.csv,93062020,19,"user_id+time_ms,video_id+time_ms,user_id+video_id+time_ms,user_id,video_id",user_id+video_id+time_ms,0.008893456213393991,True,0.0
+KuaiRand-27K\KuaiRand-27K\data\log_standard_4_22_to_5_08_27k_part2.csv,log_standard_4_22_to_5_08_27k_part2.csv,92919789,19,"user_id+time_ms,video_id+time_ms,user_id+video_id+time_ms,user_id,video_id",user_id+video_id+time_ms,0.008455464744974828,True,0.0
+KuaiRand-27K\KuaiRand-27K\data\user_features_27k.csv,user_features_27k.csv,27285,31,user_id,user_id,0.0,,
+KuaiRand-27K\KuaiRand-27K\data\video_features_basic_27k.csv,video_features_basic_27k.csv,32038725,12,video_id,video_id,0.0,,
+KuaiRand-27K\KuaiRand-27K\data\video_features_statistic_27k_part1.csv,video_features_statistic_27k_part1.csv,10679575,52,video_id,video_id,0.0,,
+KuaiRand-27K\KuaiRand-27K\data\video_features_statistic_27k_part2.csv,video_features_statistic_27k_part2.csv,10679575,52,video_id,video_id,0.0,,
+KuaiRand-27K\KuaiRand-27K\data\video_features_statistic_27k_part3.csv,video_features_statistic_27k_part3.csv,10679575,52,video_id,video_id,0.0,,

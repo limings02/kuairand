@@ -1,0 +1,15 @@
+﻿metric,value
+ctr_standard,0.37871774118515583
+ctr_random,0.1761581843736273
+ctr_diff_standard_minus_random,0.20255955681152854
+ctr_diff_bootstrap_ci_low,0.20188748380701477
+ctr_diff_bootstrap_ci_median,0.20256499930642602
+ctr_diff_bootstrap_ci_high,0.2032445480852383
+ctr_diff_z_value,577.3521099487666
+ctr_diff_p_value,0.0
+top1pct_exposure_share_standard,0.4411059153098338
+top1pct_exposure_share_random,0.012700885874985983
+hhi_standard,1.3791231205651921e-06
+hhi_random,0.00013699670844205284
+gini_standard,0.531399810191846
+gini_random,0.08080947887577361

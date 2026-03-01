@@ -1,0 +1,33 @@
+% 通用 LaTeX 头：兼容 beamer 与 pandoc fallback(article)
+\usepackage{ifxetex}
+\ifxetex
+  \usepackage{fontspec}
+  \usepackage{xeCJK}
+
+  % 避免依赖可能缺失的 CJK 字体，优先使用 Windows 常见字体
+  \IfFontExistsTF{Microsoft YaHei}{
+    \setCJKmainfont{Microsoft YaHei}
+  }{
+    \IfFontExistsTF{SimSun}{
+      \setCJKmainfont{SimSun}
+    }{
+      \IfFontExistsTF{SimHei}{
+        \setCJKmainfont{SimHei}
+      }{}
+    }
+  }
+
+  \IfFontExistsTF{Calibri}{\setmainfont{Calibri}}{}
+\fi
+
+% 只有 beamer 文档类才应用以下设置
+\makeatletter
+\@ifclassloaded{beamer}{
+  \setbeamertemplate{navigation symbols}{}
+  \setbeamerfont{title}{size=\Large}
+  \setbeamerfont{frametitle}{size=\large}
+  \setbeamerfont{normal text}{size=\normalsize}
+  \setbeamersize{text margin left=6mm, text margin right=6mm}
+  \linespread{1.08}
+}{}
+\makeatother

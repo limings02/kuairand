@@ -1,0 +1,8 @@
+pandas>=1.5
+numpy>=1.23
+matplotlib>=3.6
+duckdb>=0.9
+tqdm>=4.65
+# 可选：若希望使用 polars 引擎，可安装
+polars>=0.20
+

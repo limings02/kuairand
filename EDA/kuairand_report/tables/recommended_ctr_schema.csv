@@ -1,0 +1,9 @@
+﻿column,source,role,note
+user_id,log,key/feature,用户主键
+video_id,log,key/feature,视频主键
+time_ms/date,log,split_key,时间切分键，避免穿越
+tab,log,feature/group,场景分桶与分群评估
+is_click,log,label,pointwise CTR 标签（注意语义差异）
+user_*,user_features,feature,用户画像特征
+video_basic_*,video_features_basic,feature,视频静态内容特征
+video_stat_*,video_features_statistic,feature (慎用),可能有时间泄漏风险

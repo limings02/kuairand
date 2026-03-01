@@ -1,0 +1,70 @@
+:root {
+  --r-background-color: #ffffff;
+  --r-main-font: "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei",
+    "PingFang SC", sans-serif;
+  --r-heading-font: "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei",
+    "PingFang SC", sans-serif;
+  --r-main-font-size: 32px;
+  --r-heading-color: #0f172a;
+  --r-main-color: #1f2937;
+  --r-link-color: #0f62fe;
+  --r-selection-background-color: #dbeafe;
+}
+
+.reveal {
+  letter-spacing: 0;
+}
+
+.reveal .slides {
+  text-align: left;
+}
+
+.reveal h1,
+.reveal h2,
+.reveal h3 {
+  font-weight: 700;
+  color: #0f172a;
+  margin-bottom: 0.35em;
+}
+
+.reveal h2 {
+  font-size: 1.35em;
+}
+
+.reveal p,
+.reveal li {
+  line-height: 1.35;
+}
+
+.reveal ul,
+.reveal ol {
+  margin-top: 0.2em;
+}
+
+.reveal blockquote {
+  border-left: 6px solid #3b82f6;
+  background: #eff6ff;
+  color: #1e3a8a;
+  padding: 0.45em 0.8em;
+  width: 100%;
+  box-shadow: none;
+}
+
+.reveal img {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(2, 6, 23, 0.08);
+}
+
+.reveal code {
+  font-size: 0.78em;
+}
+
+.reveal pre code {
+  max-height: 420px;
+}
+
+.reveal .progress {
+  color: #2563eb;
+}
+
