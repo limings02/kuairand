@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "kuairand"
+version = "1.0.0"
+description = "KuaiRand-27K 数据分析与 DIN Baseline 预处理工具包"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "pandas>=1.5.0",
+    "numpy>=1.23.0",
+    "pyarrow>=10.0.0",
+    "tqdm>=4.64.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+eda = [
+    "matplotlib>=3.6",
+    "duckdb>=0.9",
+]
+monitoring = [
+    "psutil>=5.9.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+all = ["kuairand[eda,monitoring,dev]"]
+
+[project.scripts]
+kuairand-din-build = "kuairand.din_baseline.main_build_dataset:main"
+kuairand-eda = "scripts.run_eda:main"
+
+[tool.setuptools.packages.find]
+include = ["kuairand*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -57,7 +57,19 @@ desktop.ini
 .env.*
 
 # Large raw datasets (do not commit to GitHub)
-KuaiRand-27K/KuaiRand-27K/data/
+data/
+KuaiRand-27K/
+
+# Legacy directories (pending deletion, locked by IDE)
+din_baseline/
+
+# Pipeline outputs
+output/
+output_test/
+
+# EDA generated artifacts (can regenerate)
+reports/eda_report/figures/
+reports/eda_report/tables/
 
 # Local databases
 *.sqlite

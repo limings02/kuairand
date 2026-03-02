@@ -1,5 +1,0 @@
-﻿method,applicable_to,description,bias_risk
-无需显式负采样(pointwise),CTR pointwise,曝光未点样本天然为负例（is_click=0）,主要受曝光策略偏置影响
-曝光未点负采样,ranking/pairwise,从同用户曝光未点击集中抽负例,偏向已曝光候选，受日志策略影响
-Uniform 全局负采样,ranking/pairwise,从全局视频池均匀采负,可能产生过易负例，分布偏离线上
-同类 hard negative,ranking/pairwise,按同作者/同标签等语义近邻采负,更难但更易引入选择偏差，需校准

@@ -1,0 +1,232 @@
+# ============================================================================
+# KuaiRand-27K  DIN Baseline（严格版）预处理配置
+# 目标环境: 16GB RAM
+# ============================================================================
+# 本配置文件控制整个数据预处理 pipeline 的所有参数。
+# 所有路径、阈值、分桶边界均可在此修改，无需改动代码。
+
+# --------------------------------------------------
+# 1. 数据路径配置
+# --------------------------------------------------
+data:
+  # data_root: KuaiRand-27K 原始 CSV 所在目录
+  # 可通过 CLI --data_root 覆盖
+  data_root: "data/KuaiRand-27K"
+
+  # output_root: 所有产物输出根目录
+  # 可通过 CLI --output_root 覆盖
+  output_root: "output"
+
+  # --- 日志文件配置 ---
+  # 每个来源可包含多个 part 文件（行切分），读取后视为同 schema 拼接
+  log_files:
+    # standard_pre: 实验前标准日志，仅用作历史来源，不产生样本
+    standard_pre:
+      - "log_standard_4_08_to_4_21_27k_part1.csv"
+      - "log_standard_4_08_to_4_21_27k_part2.csv"
+    # standard_exp: 实验期标准日志，用于 train/val/test_standard 样本
+    standard_exp:
+      - "log_standard_4_22_to_5_08_27k_part1.csv"
+      - "log_standard_4_22_to_5_08_27k_part2.csv"
+    # random_exp: 随机曝光日志，用于 test_random 样本
+    random_exp:
+      - "log_random_4_22_to_5_08_27k.csv"
+
+  # --- 静态特征文件 ---
+  user_features_file: "user_features_27k.csv"
+  video_features_basic_file: "video_features_basic_27k.csv"
+
+# --------------------------------------------------
+# 2. 标签配置
+# --------------------------------------------------
+label:
+  # 主任务标签列（二分类）
+  # 可配置切换为 is_click，但严格版 baseline 默认用 long_view
+  label_col: "long_view"
+
+# --------------------------------------------------
+# 3. 历史行为序列配置
+# --------------------------------------------------
+history:
+  # 最大历史序列长度（截断）
+  max_hist_len: 50
+  # 最大回溯天数
+  max_hist_days: 30
+  # 最小历史长度（不足则丢弃该样本）
+  min_hist_len: 1
+
+  # 正反馈信号列：任一为 1 即可入选历史池
+  positive_signals:
+    - "long_view"
+    - "is_like"
+    - "is_follow"
+    - "is_comment"
+    - "is_forward"
+
+  # 去重策略：相邻同 video_id 且时间间隔 < gap 秒，保留最后一次
+  dedup:
+    enabled: true
+    same_video_gap_sec: 30
+
+  # 是否将 random_exp 事件加入历史池
+  # 默认关闭以简化 baseline；打开后 random 曝光也可贡献历史
+  use_random_as_history: false
+
+  # 生成可选历史辅助字段（delta_t_bucket / play_ratio_bucket / hist_tab）
+  # 默认开启，后续模型可自行选择是否使用
+  build_optional_hist_features: true
+
+# --------------------------------------------------
+# 4. 分桶规则（特征离散化）
+# --------------------------------------------------
+buckets:
+  # delta_t_bucket: 历史事件与当前样本的时间差（秒）
+  delta_t_boundaries: [10, 60, 300, 1800, 7200, 86400, 604800]
+
+  # play_ratio_bucket: 播放比例 = clip(play_time_ms / max(duration_ms,1), 0, clip_max)
+  play_ratio_boundaries: [0.1, 0.3, 0.5, 0.8, 1.0]
+  play_ratio_clip_max: 3.0
+
+  # video_duration_bucket: 视频时长（毫秒）
+  video_duration_boundaries: [7000, 18000, 30000, 60000]
+
+# --------------------------------------------------
+# 5. 数据切分（严格时序）
+# --------------------------------------------------
+split:
+  # standard_exp 按 time_ms 排序后的比例切分
+  # train : val : test_standard = 70% : 10% : 20%
+  train_ratio: 0.70
+  val_ratio: 0.10
+  # test_standard_ratio 自动计算 = 1 - train - val = 0.20
+
+  # test_random: 来自 random_exp，单独保存，不参与比例切分
+
+# --------------------------------------------------
+# 6. 内存约束参数
+# --------------------------------------------------
+memory:
+  # 按用户哈希分桶数量（越大单桶越小，内存越少，但 I/O 越多）
+  # 16GB RAM 推荐 50~200
+  num_user_buckets: 100
+
+  # CSV 分块读取行数
+  chunk_size: 500000
+
+  # 随机种子
+  seed: 42
+
+# --------------------------------------------------
+# 7. 特征列配置
+# --------------------------------------------------
+features:
+  # 日志表需要读取的列（列裁剪）
+  log_cols:
+    - "user_id"
+    - "video_id"
+    - "time_ms"
+    - "is_click"
+    - "is_like"
+    - "is_follow"
+    - "is_comment"
+    - "is_forward"
+    - "long_view"
+    - "play_time_ms"
+    - "duration_ms"
+    - "is_rand"
+    - "tab"
+    - "date"
+    - "hourmin"
+
+  # video_features_basic 需要读取的列
+  video_basic_cols:
+    - "video_id"
+    - "author_id"
+    - "video_type"
+    - "upload_type"
+    - "video_duration"
+
+  # 用户特征文件需要读取的所有列
+  user_all_cols:
+    - "user_id"
+    - "user_active_degree"
+    - "is_lowactive_period"
+    - "is_live_streamer"
+    - "is_video_author"
+    - "follow_user_num"
+    - "follow_user_num_range"
+    - "fans_user_num"
+    - "fans_user_num_range"
+    - "friend_user_num"
+    - "friend_user_num_range"
+    - "register_days"
+    - "register_days_range"
+    - "onehot_feat0"
+    - "onehot_feat1"
+    - "onehot_feat2"
+    - "onehot_feat3"
+    - "onehot_feat4"
+    - "onehot_feat5"
+    - "onehot_feat6"
+    - "onehot_feat7"
+    - "onehot_feat8"
+    - "onehot_feat9"
+    - "onehot_feat10"
+    - "onehot_feat11"
+    - "onehot_feat12"
+    - "onehot_feat13"
+    - "onehot_feat14"
+    - "onehot_feat15"
+    - "onehot_feat16"
+    - "onehot_feat17"
+
+  # 用户离散特征（全部需要索引化）
+  user_sparse_cols:
+    - "user_active_degree"
+    - "is_lowactive_period"
+    - "is_live_streamer"
+    - "is_video_author"
+    - "follow_user_num_range"
+    - "fans_user_num_range"
+    - "friend_user_num_range"
+    - "register_days_range"
+    - "onehot_feat0"
+    - "onehot_feat1"
+    - "onehot_feat2"
+    - "onehot_feat3"
+    - "onehot_feat4"
+    - "onehot_feat5"
+    - "onehot_feat6"
+    - "onehot_feat7"
+    - "onehot_feat8"
+    - "onehot_feat9"
+    - "onehot_feat10"
+    - "onehot_feat11"
+    - "onehot_feat12"
+    - "onehot_feat13"
+    - "onehot_feat14"
+    - "onehot_feat15"
+    - "onehot_feat16"
+    - "onehot_feat17"
+
+  # 用户连续特征的原始源列（用于 log1p 变换）
+  user_dense_source_cols:
+    - "follow_user_num"
+    - "fans_user_num"
+    - "friend_user_num"
+    - "register_days"
+
+  # 用户连续特征输出名（与 source 一一对应）
+  user_dense_output_cols:
+    - "log1p_follow_user_num"
+    - "log1p_fans_user_num"
+    - "log1p_friend_user_num"
+    - "log1p_register_days"
+
+# --------------------------------------------------
+# 8. 不使用的字段（严格版 baseline 有意排除）
+# --------------------------------------------------
+# 以下字段默认不接入，原因见注释：
+# - video_features_statistic_*.csv: 统计特征存在时点一致性争议
+# - is_rand 作为模型输入: 仅保留为元数据切片字段
+# - caption / category 文本补充文件: 基础 baseline 不使用
