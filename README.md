@@ -120,6 +120,14 @@ python -m kuairand.din_baseline.main_build_dataset `
   --config configs/din_baseline_mem16gb.yaml `
   --data_root data/KuaiRand-27K `
   --output_root output
+
+# 当 Stage D 已完成、Stage E/F 失败时，从 Stage E 断点续跑（复用已有中间产物）
+python -m kuairand.din_baseline.main_build_dataset `
+  --config configs/din_baseline_mem16gb.yaml `
+  --data_root data/KuaiRand-27K `
+  --output_root output `
+  --resume_from_stage E `
+  --force_streaming_split
 ```
 
 ### CLI 参数
@@ -136,6 +144,8 @@ python -m kuairand.din_baseline.main_build_dataset `
 | `--seed` | 随机种子 | 42 |
 | `--num_user_buckets` | 用户分桶数 | 100 |
 | `--chunk_size` | CSV 分块读取行数 | 500000 |
+| `--resume_from_stage` | 断点续跑起点：`A`/`E`/`F` | `A` |
+| `--force_streaming_split` | Stage E 强制流式切分（推荐全量开启） | False |
 
 ### Pipeline 阶段
 
@@ -145,8 +155,15 @@ python -m kuairand.din_baseline.main_build_dataset `
 | Stage B | 流式构建所有 vocab | ~300MB |
 | Stage C | 用户/视频特征预处理 | ~200MB |
 | Stage D | 逐桶构造 DIN 样本 | ~400MB |
-| Stage E | 合并 + 时序切分 | ~3-8GB |
+| Stage E | 流式切分 + 合并分片 | ~1-3GB（与 batch 大小相关） |
 | Stage F | Sanity checks | ~2-4GB |
+
+### Stage E 断点续跑机制
+
+- Stage E 会在 `output/processed/_stage_e_resume_state.json` 持久化进度。
+- 分片结果写入 `output/processed/_stage_e_parts/<split>/bucket_*.parquet`。
+- 中断后重跑 `--resume_from_stage E` 会跳过已完成桶，继续未完成桶。
+- 最终会自动合并为：`train.parquet` / `val.parquet` / `test_standard.parquet` / `test_random.parquet`。
 
 ### 输出产物
 
