@@ -1,28 +1,33 @@
 """
-内存友好的 Parquet 流式数据集。
+内存友好的 Parquet 流式数据集（高性能版）。
 
-为什么必须用 IterableDataset 而非 MapDataset？
-───────────────────────────────────────────────
-训练集超过 1.3 亿行（train.parquet ≈ 130M 行）。
-如果用 Map-style Dataset / pandas.read_parquet() 一次性全量加载到内存，
-按每行约 3KB 估算需要 ~380GB → 远远超过 16GB RAM 上限。
+性能优化核心思路
+────────────────
+旧版设计：Dataset 逐行 yield 单个样本 dict → DataLoader collate 逐样本拼装 tensor
+  瓶颈：130M 行 × 50 列 = 65 亿次 Python dict 操作，训练 1 epoch 需要 ~10 小时
 
-IterableDataset 按 parquet row group 逐批读取：
-  - 每次只读 1 个 row group（约 186K 行 ≈ 0.5GB Arrow 格式）
-  - 处理完即释放，任何时刻内存中只保留当前 row group 数据
-  - 可选开启跨 row group shuffle buffer（默认关闭以省内存）
+新版设计：Dataset 按 row group 读取后直接用 **numpy 向量化切片** 产出预组装好的 batch
+  - 读 row group → {col: np.ndarray[n_rows, ...]}
+  - shuffle 行索引（numpy 操作，微秒级）
+  - 按 batch_size 切片 → {col: np.ndarray[B, ...]}  ← 全部是 numpy fancy indexing
+  - DataLoader 用 batch_size=None，collate 只做 numpy→tensor（零 Python 循环）
+
+预期加速：数据管道从 ~3000 samp/s → 10 万+ samp/s（~30-50 倍）
+
+为什么用 IterableDataset 而非 MapDataset？
+───────────────────────────────────────────
+训练集 130M 行，全量加载内存需要 ~380GB，IterableDataset 按 row group 逐批读取，
+任何时刻只保留 1 个 row group（~186K 行 ≈ 500MB Arrow）。
 
 打乱策略
 ────────
-  1. 每个 epoch 对 row group 顺序做随机排列
-  2. 在每个 row group 内部对行做随机排列
-  3.（可选）跨 row group shuffle buffer：从连续 row group 取出样本放入缓冲区打乱
-  策略 1+2 已经提供足够好的近似全局 shuffle，且内存可控。
+  1. 每个 epoch 随机排列 row group 顺序
+  2. 每个 row group 内部 shuffle 行索引
+  3. 按 batch_size 切分后直接 yield
 
 多 Worker 分片
 ──────────────
   按 row group id 轮询分片：worker_i 处理 rg_id % num_workers == worker_i 的 row group。
-  保证不重不漏。
 """
 
 import logging
@@ -133,24 +138,24 @@ def resolve_columns(
 
 
 # ─────────────────────────────────────────────────────────────
-# IterableDataset（默认推荐）
+# IterableDataset（高性能版：预组装 batch）
 # ─────────────────────────────────────────────────────────────
 
 class ParquetIterableDataset(IterableDataset):
     """
-    内存友好的 Parquet 流式数据集。
+    高性能 Parquet 流式数据集。
 
-    使用 pyarrow.parquet.ParquetFile 按 row group 逐批读取数据，
-    每次只在内存中保留一个 row group 的内容。
+    核心优化：直接 yield 预组装好的 batch（dict of numpy arrays），
+    避免逐样本 Python 循环。DataLoader 使用 batch_size=None 配合。
 
     Args:
         parquet_path: parquet 文件路径
         columns: 需要读取的列名列表
-        max_hist_len: 历史序列定长（用于 list 列 reshape）
-        list_columns: set，所有 list<int> 类型的列名
-        float_columns: set，所有 float 类型的列名
-        shuffle: 是否打乱（训练时为 True）
-        shuffle_buffer_size: 跨 row group shuffle buffer 大小；0 = 仅 row group 内打乱
+        batch_size: 每个 batch 的样本数
+        max_hist_len: 历史序列定长
+        list_columns: set，list<int> 列名（自动检测）
+        float_columns: set，float 列名（自动检测）
+        shuffle: 是否打乱
         base_seed: 随机种子基数
     """
 
@@ -158,19 +163,19 @@ class ParquetIterableDataset(IterableDataset):
         self,
         parquet_path: str,
         columns: List[str],
+        batch_size: int = 128,
         max_hist_len: int = 50,
         list_columns: Optional[Set[str]] = None,
         float_columns: Optional[Set[str]] = None,
         shuffle: bool = False,
-        shuffle_buffer_size: int = 0,
         base_seed: int = 42,
     ):
         super().__init__()
         self.parquet_path = str(parquet_path)
         self.columns = columns
+        self.batch_size = batch_size
         self.max_hist_len = max_hist_len
         self.shuffle = shuffle
-        self.shuffle_buffer_size = shuffle_buffer_size
         self.base_seed = base_seed
         self._epoch = 0
 
@@ -191,9 +196,10 @@ class ParquetIterableDataset(IterableDataset):
 
         logger.info(
             "ParquetIterableDataset 初始化: path=%s, rows=%d, row_groups=%d, cols=%d, "
-            "list_cols=%d, float_cols=%d, shuffle=%s",
+            "batch_size=%d, list_cols=%d, float_cols=%d, shuffle=%s",
             self.parquet_path, self.num_rows, self.num_row_groups,
-            len(self.columns), len(self.list_columns), len(self.float_columns),
+            len(self.columns), self.batch_size,
+            len(self.list_columns), len(self.float_columns),
             self.shuffle,
         )
 
@@ -205,6 +211,7 @@ class ParquetIterableDataset(IterableDataset):
         """
         读取一个 row group，返回 {列名: numpy 数组} 字典。
 
+        全部使用 numpy 向量化操作，无 Python 逐行循环。
         - list 列 → 2D array [n_rows, max_hist_len]
         - float 列 → 1D float32 array [n_rows]
         - int 列  → 1D int64 array [n_rows]
@@ -239,13 +246,33 @@ class ParquetIterableDataset(IterableDataset):
 
         return arrays
 
+    def _slice_batch(
+        self,
+        arrays: Dict[str, np.ndarray],
+        indices: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """
+        用 numpy fancy indexing 向量化切片出一个 batch。
+
+        这是性能优化的关键：
+          旧版：for i in range(batch_size): for col in columns: sample[col] = arr[i]
+          新版：for col in columns: batch[col] = arr[indices]  ← 全部向量化
+
+        一个 batch 只需 ~50 次 numpy 操作（每列一次），
+        而非旧版的 batch_size × 50 = 6400 次 Python dict 操作。
+        """
+        batch: Dict[str, np.ndarray] = {}
+        for col_name in self.columns:
+            batch[col_name] = arrays[col_name][indices]
+        return batch
+
     def __iter__(self):
         """
-        迭代逻辑：
+        迭代逻辑（高性能版）：
         1. 确定当前 worker 负责哪些 row group
         2. 可选打乱 row group 顺序
-        3. 对每个 row group 逐行 yield 样本
-        4. 可选跨 row group shuffle buffer
+        3. 对每个 row group：numpy shuffle 索引 → 按 batch_size 切片 → yield 预组装 batch
+        4. 全程无逐样本 Python 循环
         """
         # ── Worker 分片 ──
         worker_info = torch.utils.data.get_worker_info()
@@ -261,55 +288,31 @@ class ParquetIterableDataset(IterableDataset):
 
         # ── 随机种子（每个 epoch × worker 不同）──
         seed = self.base_seed + self._epoch * 100_000 + worker_id
-        rng = random.Random(seed)
         np_rng = np.random.RandomState(seed)
+        py_rng = random.Random(seed)
 
         if self.shuffle:
-            rng.shuffle(rg_indices)
+            py_rng.shuffle(rg_indices)
 
         # ── 每个 worker 独立打开文件句柄（多进程安全）──
         pf = pq.ParquetFile(self.parquet_path)
-
-        # ── Shuffle buffer（可选）──
-        buffer: list = []
-        use_buffer = self.shuffle and self.shuffle_buffer_size > 0
 
         for rg_idx in rg_indices:
             arrays = self._read_row_group(pf, rg_idx)
             n_rows = arrays[self.columns[0]].shape[0]
 
-            # row group 内部 shuffle
-            indices = np.arange(n_rows)
+            # row group 内部 shuffle 索引（numpy 操作，微秒级）
             if self.shuffle:
-                np_rng.shuffle(indices)
+                indices = np_rng.permutation(n_rows).astype(np.int64)
+            else:
+                indices = np.arange(n_rows, dtype=np.int64)
 
-            for i in indices:
-                sample = {}
-                for col_name in self.columns:
-                    arr = arrays[col_name]
-                    if arr.ndim == 2:
-                        sample[col_name] = arr[i]        # 1D np.array
-                    else:
-                        sample[col_name] = arr[i].item()  # Python int / float
-                # 把 numpy 标量转成 Python 原生类型（方便 collate 判断类型）
-                # arr[i].item() 已经做了这件事
-
-                if use_buffer:
-                    buffer.append(sample)
-                    if len(buffer) >= self.shuffle_buffer_size:
-                        rng.shuffle(buffer)
-                        # 释放一半（避免缓冲区无限增长）
-                        half = len(buffer) // 2
-                        for s in buffer[:half]:
-                            yield s
-                        buffer = buffer[half:]
-                else:
-                    yield sample
-
-        # ── 清空 buffer ──
-        if buffer:
-            rng.shuffle(buffer)
-            yield from buffer
+            # ── 按 batch_size 向量化切片，直接 yield 预组装好的 batch ──
+            # 无逐样本 Python 循环！每 yield 只做 ~50 次 numpy fancy indexing。
+            for start in range(0, n_rows, self.batch_size):
+                end = min(start + self.batch_size, n_rows)
+                batch_indices = indices[start:end]
+                yield self._slice_batch(arrays, batch_indices)
 
 
 # ─────────────────────────────────────────────────────────────

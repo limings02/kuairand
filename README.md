@@ -348,3 +348,27 @@ python scripts/run_eda.py \
 - Line endings 统一管理（`.gitattributes`）
 - Editor 配置统一（`.editorconfig`）
 - 原始数据和产出通过 `.gitignore` 排除
+
+
+# 完整训练（流式读 parquet，适合 16GB RAM + 4GB 显存）
+python -m src.main_train_din `
+    --config configs/train_din_mem16gb.yaml `
+    --data_root output/processed `
+    --meta_root output/meta `
+    --vocabs_root output/vocabs `
+    --run_dir output/exp_runs/din_baseline
+
+# 快速 debug（只加载 1000 行，验证流程跑通）
+python -m src.main_train_din `
+    --config configs/train_din_mem16gb.yaml `
+    --run_dir output/exp_runs/din_debug `
+    --debug_rows 1000 --epochs 1
+
+# 仅评估（加载已有 best checkpoint，跳过训练）
+python -m src.main_train_din `
+    --config configs/train_din_mem16gb.yaml `
+    --run_dir output/exp_runs/din_baseline `
+    --eval_only
+
+# 冒烟测试（1 个 batch forward+backward）
+python scripts/smoke_test_din.py

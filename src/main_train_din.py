@@ -23,11 +23,11 @@ from typing import Dict, Optional
 
 import torch
 import yaml
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 
 # ── 项目内部导入 ──
-from src.datasets.collate import DINCollateFn, reset_collate_print_flag
+from src.datasets.collate import BatchCollateFn, SampleCollateFn, reset_collate_print_flag
 from src.datasets.parquet_iterable_dataset import (
     ParquetIterableDataset,
     resolve_columns,
@@ -196,10 +196,10 @@ def build_dataloader(
         num_workers = eval_cfg.get("num_workers", dl_cfg.get("num_workers", 2))
 
     max_hist_len = config["model"]["max_hist_len"]
-    collate_fn = DINCollateFn(user_dense_cols=fields_cfg["user_dense_cols"])
 
     if debug_rows > 0:
         from src.datasets.parquet_iterable_dataset import DebugMapDataset
+        collate_fn = SampleCollateFn(user_dense_cols=fields_cfg["user_dense_cols"])
         dataset = DebugMapDataset(
             parquet_path=parquet_path,
             columns=columns,
@@ -215,19 +215,27 @@ def build_dataloader(
             pin_memory=dl_cfg.get("pin_memory", False),
         )
 
-    # ── 默认：IterableDataset ──
+    # ── 默认：IterableDataset（预组装 batch）──
+    # Dataset 内部已按 batch_size 切分，yield dict[str, np.ndarray]
+    # DataLoader 使用 batch_size=None 直接透传
     dataset = ParquetIterableDataset(
         parquet_path=parquet_path,
         columns=columns,
+        batch_size=batch_size,  # 传给 Dataset，内部预组装 batch
         max_hist_len=max_hist_len,
         shuffle=shuffle,
-        shuffle_buffer_size=dl_cfg.get("shuffle_buffer_size", 0),
         base_seed=config.get("seed", 42),
+    )
+
+    # BatchCollateFn 只做 numpy→tensor（零 Python 循环）
+    collate_fn = BatchCollateFn(
+        user_dense_cols=fields_cfg["user_dense_cols"],
+        float_columns=dataset.float_columns,
     )
 
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=None,  # Dataset 已预组装 batch
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=dl_cfg.get("pin_memory", True) and torch.cuda.is_available(),
@@ -364,7 +372,7 @@ def main():
     # ── 训练 ──
     optimizer = build_optimizer(model, config)
     criterion = torch.nn.BCEWithLogitsLoss()
-    scaler = GradScaler(enabled=config["training"]["use_amp"] and device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=config["training"]["use_amp"] and device.type == "cuda")
 
     tcfg = config["training"]
     best_metric_val = None

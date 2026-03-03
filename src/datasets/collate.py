@@ -1,15 +1,22 @@
 """
-Collate 函数：将 DataLoader 的一批样本字典转换为模型所需的 Tensor 字典。
+Collate 函数：将预组装的 numpy batch 转换为 PyTorch Tensor 字典。
 
-职责：
-  - list<int> 历史序列 → LongTensor [B, L]
-  - int 标量列（sparse / label / meta） → LongTensor [B]
-  - float 标量列 → FloatTensor [B]
-  - 将用户 dense 列合并为单个 FloatTensor [B, D_dense]
+性能优化说明
+───────────
+旧版 collate 接收 list[dict]（128 个单样本 dict），需要逐字段 list 合并再转 tensor。
+  每个 batch 产生 128 × 50 = 6400 次 Python list append + numpy stack。
+
+新版 collate 接收单个 dict[str, np.ndarray]（预组装好的 batch），
+  只需对每个 numpy array 调用一次 torch.from_numpy()（零复制转换）。
+  每个 batch 仅 ~50 次 torch.from_numpy() 调用，无 Python 循环。
+
+两个入口：
+  - BatchCollateFn: 用于 ParquetIterableDataset（预组装 batch）
+  - SampleCollateFn: 用于 DebugMapDataset（逐样本 batch，仅 debug）
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
 import torch
@@ -20,35 +27,85 @@ logger = logging.getLogger(__name__)
 _PRINTED_BATCH_SCHEMA = False
 
 
-class DINCollateFn:
+class BatchCollateFn:
     """
-    可调用的 Collate 函数对象。
+    高性能 Collate：接收预组装好的 numpy batch dict → 转为 tensor dict。
 
-    在 DataLoader 中使用：
-        DataLoader(dataset, collate_fn=DINCollateFn(user_dense_cols))
+    ParquetIterableDataset yield 的已经是 {col: np.ndarray[B, ...]} 形式，
+    此 collate 只需做 numpy→tensor 转换（torch.from_numpy 走零复制路径），
+    以及合并 user_dense 列。
+
+    与 DataLoader(batch_size=None) 搭配使用。
 
     Args:
-        user_dense_cols: 用户 dense 列名列表，collate 时会合并成 [B, D] 的 user_dense tensor
+        user_dense_cols: 需要合并为 [B, D] 的 dense 列名列表
+        float_columns: float 类型列名集合
+    """
+
+    def __init__(
+        self,
+        user_dense_cols: Optional[List[str]] = None,
+        float_columns: Optional[Set[str]] = None,
+    ):
+        self.user_dense_cols = user_dense_cols or []
+        self.float_columns = float_columns or set()
+
+    def __call__(self, batch_np: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """
+        将 numpy batch → tensor batch。
+
+        numpy→torch 转换使用 torch.from_numpy()，对连续数组会走零复制路径，
+        对非连续数组（fancy indexing 结果）自动做一次 memcpy，也比 Python 循环快几个数量级。
+        """
+        global _PRINTED_BATCH_SCHEMA
+
+        result: Dict[str, torch.Tensor] = {}
+
+        for key, arr in batch_np.items():
+            if key in self.float_columns:
+                # float32 列直接转
+                result[key] = torch.from_numpy(np.ascontiguousarray(arr)).float()
+            else:
+                # int / list<int> 列 → LongTensor
+                result[key] = torch.from_numpy(np.ascontiguousarray(arr)).long()
+
+        # ── 合并用户 dense 列为 [B, D_dense] ──
+        if self.user_dense_cols:
+            dense_parts = []
+            for col in self.user_dense_cols:
+                if col in result:
+                    t = result[col]
+                    if t.dim() == 1:
+                        dense_parts.append(t.unsqueeze(1))
+                    else:
+                        dense_parts.append(t)
+            if dense_parts:
+                result["user_dense"] = torch.cat(dense_parts, dim=1)
+
+        # ── 首次打印 batch schema ──
+        if not _PRINTED_BATCH_SCHEMA:
+            lines = ["Batch schema（首次打印）:"]
+            for k, v in result.items():
+                if isinstance(v, torch.Tensor):
+                    lines.append(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+            logger.info("\n".join(lines))
+            _PRINTED_BATCH_SCHEMA = True
+
+        return result
+
+
+class SampleCollateFn:
+    """
+    逐样本 Collate（仅用于 DebugMapDataset）。
+
+    接收 list[dict]（每个 dict 是一个样本），合并为 tensor batch。
+    只在 debug_rows > 0 时使用，大规模训练不要用。
     """
 
     def __init__(self, user_dense_cols: Optional[List[str]] = None):
         self.user_dense_cols = user_dense_cols or []
 
     def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
-        """
-        将一批样本字典列表转换为 Tensor 字典。
-
-        Args:
-            batch: list of dicts，每个 dict 是一个样本（来自 Dataset.__getitem__ 或 __iter__）
-                   - 1D np.ndarray 项  → list columns（历史序列）
-                   - int 项            → 标量 int 列
-                   - float 项          → 标量 float 列
-
-        Returns:
-            dict of {col_name: Tensor}，外加 'user_dense': [B, D_dense] FloatTensor
-        """
-        global _PRINTED_BATCH_SCHEMA
-
         if not batch:
             return {}
 
@@ -60,41 +117,22 @@ class DINCollateFn:
             sample_val = first[key]
 
             if isinstance(sample_val, np.ndarray):
-                # list<int> 历史序列列 → [B, L] LongTensor
-                stacked = np.stack(vals)
-                result[key] = torch.from_numpy(stacked).long()
-
+                result[key] = torch.from_numpy(np.stack(vals)).long()
             elif isinstance(sample_val, float):
-                # 浮点标量 → FloatTensor
                 result[key] = torch.tensor(vals, dtype=torch.float32)
-
             elif isinstance(sample_val, int):
-                # 整型标量（label / sparse / meta）→ LongTensor
                 result[key] = torch.tensor(vals, dtype=torch.long)
-
             else:
-                # 其他类型（例如字符串）→ 保持为 Python list
                 result[key] = vals
 
-        # ── 合并用户 dense 列为 [B, D_dense] ──
+        # 合并 dense
         if self.user_dense_cols:
             dense_parts = []
             for col in self.user_dense_cols:
                 if col in result and isinstance(result[col], torch.Tensor):
-                    dense_parts.append(result[col].unsqueeze(1))  # [B, 1]
+                    dense_parts.append(result[col].unsqueeze(1))
             if dense_parts:
-                result["user_dense"] = torch.cat(dense_parts, dim=1)  # [B, D_dense]
-
-        # ── 首次打印 batch schema ──
-        if not _PRINTED_BATCH_SCHEMA:
-            lines = ["Batch schema（首次打印）:"]
-            for k, v in result.items():
-                if isinstance(v, torch.Tensor):
-                    lines.append(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
-                else:
-                    lines.append(f"  {k}: type={type(v).__name__}, len={len(v)}")
-            logger.info("\n".join(lines))
-            _PRINTED_BATCH_SCHEMA = True
+                result["user_dense"] = torch.cat(dense_parts, dim=1)
 
         return result
 

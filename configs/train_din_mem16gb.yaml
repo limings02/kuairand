@@ -133,11 +133,11 @@ model:
 # 训练配置
 # --------------------------------------------------
 training:
-  epochs: 3
+  epochs: 1
   batch_size: 128
   learning_rate: 0.001
   weight_decay: 1.0e-5
-  optimizer: "adam"              # adam / adamw
+  optimizer: "adamw"              # adam / adamw
 
   # AMP 混合精度（减少 ~50% 显存）
   use_amp: true
