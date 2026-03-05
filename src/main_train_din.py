@@ -23,7 +23,7 @@ from typing import Dict, Optional
 
 import torch
 import yaml
-from torch.amp import GradScaler
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader
 
 # ── 项目内部导入 ──
@@ -65,6 +65,9 @@ def parse_args():
     p.add_argument("--device", type=str, default=None, help="覆盖 device (auto/cuda/cpu)")
     p.add_argument("--epochs", type=int, default=None, help="覆盖训练 epoch 数")
     p.add_argument("--batch_size", type=int, default=None, help="覆盖训练 batch_size")
+    p.add_argument("--model_variant", type=str, default=None, help="覆盖 model.variant: din / din_psrg / din_psrg_pcrg")
+    p.add_argument("--num_queries", type=int, default=None, help="覆盖 model.pcrg.num_queries")
+    p.add_argument("--pcrg_aggregation", type=str, default=None, help="覆盖 model.pcrg.aggregation")
     p.add_argument("--eval_only", action="store_true", help="仅评估（跳过训练，加载 best checkpoint）")
     p.add_argument("--debug_rows", type=int, default=0, help=">0 时使用 DebugMapDataset 加载前 N 行")
     return p.parse_args()
@@ -79,6 +82,15 @@ def load_config(args) -> dict:
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    # 兼容别名：有些配置把 training 写成 train
+    if "training" not in config and "train" in config:
+        config["training"] = config["train"]
+
+    # 确保新增 ADS 子配置存在（便于 CLI override）
+    config.setdefault("model", {})
+    config["model"].setdefault("psrg", {})
+    config["model"].setdefault("pcrg", {})
+
     # CLI 覆盖
     if args.data_root:
         config["data"]["data_root"] = args.data_root
@@ -92,6 +104,12 @@ def load_config(args) -> dict:
         config["training"]["epochs"] = args.epochs
     if args.batch_size:
         config["training"]["batch_size"] = args.batch_size
+    if args.model_variant:
+        config["model"]["variant"] = args.model_variant
+    if args.num_queries is not None:
+        config["model"]["pcrg"]["num_queries"] = args.num_queries
+    if args.pcrg_aggregation:
+        config["model"]["pcrg"]["aggregation"] = args.pcrg_aggregation
 
     # run_dir
     run_name = config.get("run_name", "din_baseline")
@@ -244,7 +262,7 @@ def build_dataloader(
         dataset,
         batch_size=None,  # Dataset 已预组装 batch
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn,  # type: ignore[arg-type]
         pin_memory=dl_cfg.get("pin_memory", True) and torch.cuda.is_available(),
         prefetch_factor=dl_cfg.get("prefetch_factor", 2) if num_workers > 0 else None,
         worker_init_fn=_worker_init_fn if num_workers > 0 else None,
@@ -322,6 +340,14 @@ def main():
     logger.info("=" * 70)
     logger.info("DIN Baseline 训练启动")
     logger.info("实验目录: %s", run_dir)
+    logger.info(
+        "模型配置: variant=%s | psrg.enabled=%s | pcrg.enabled=%s | pcrg.num_queries=%s | pcrg.aggregation=%s",
+        config.get("model", {}).get("variant", "din"),
+        config.get("model", {}).get("psrg", {}).get("enabled", False),
+        config.get("model", {}).get("pcrg", {}).get("enabled", False),
+        config.get("model", {}).get("pcrg", {}).get("num_queries", "-"),
+        config.get("model", {}).get("pcrg", {}).get("aggregation", "-"),
+    )
     logger.info("=" * 70)
 
     # 保存配置快照
@@ -389,7 +415,7 @@ def main():
     for epoch in range(tcfg["epochs"]):
         # 为 IterableDataset 设置 epoch（影响 shuffle 种子）
         if hasattr(train_loader.dataset, "set_epoch"):
-            train_loader.dataset.set_epoch(epoch)
+            getattr(train_loader.dataset, "set_epoch")(epoch)
 
         # 重置 collate 打印标记
         reset_collate_print_flag()

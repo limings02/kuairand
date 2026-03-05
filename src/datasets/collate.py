@@ -16,7 +16,7 @@ Collate 函数：将预组装的 numpy batch 转换为 PyTorch Tensor 字典。
 """
 
 import logging
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import numpy as np
 import torch
@@ -50,7 +50,7 @@ class BatchCollateFn:
         self.user_dense_cols = user_dense_cols or []
         self.float_columns = float_columns or set()
 
-    def __call__(self, batch_np: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch_np: Dict[str, np.ndarray]) -> Dict[str, Any]:
         """
         将 numpy batch → tensor batch。
 
@@ -59,12 +59,16 @@ class BatchCollateFn:
         """
         global _PRINTED_BATCH_SCHEMA
 
-        result: Dict[str, torch.Tensor] = {}
+        result: Dict[str, Any] = {}
 
         for key, arr in batch_np.items():
             if key in self.float_columns:
                 # float32 列直接转
                 result[key] = torch.from_numpy(np.ascontiguousarray(arr)).float()
+            elif arr.dtype.kind in {"U", "S", "O"}:
+                # 字符串/对象列（例如 meta_log_source）保留为 Python list。
+                # 这些字段仅用于分析/切片，不参与模型前向。
+                result[key] = arr.tolist()
             else:
                 # int / list<int> 列 → LongTensor
                 result[key] = torch.from_numpy(np.ascontiguousarray(arr)).long()
@@ -75,9 +79,9 @@ class BatchCollateFn:
             for col in self.user_dense_cols:
                 if col in result:
                     t = result[col]
-                    if t.dim() == 1:
+                    if isinstance(t, torch.Tensor) and t.dim() == 1:
                         dense_parts.append(t.unsqueeze(1))
-                    else:
+                    elif isinstance(t, torch.Tensor):
                         dense_parts.append(t)
             if dense_parts:
                 result["user_dense"] = torch.cat(dense_parts, dim=1)
@@ -105,12 +109,12 @@ class SampleCollateFn:
     def __init__(self, user_dense_cols: Optional[List[str]] = None):
         self.user_dense_cols = user_dense_cols or []
 
-    def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch: List[dict]) -> Dict[str, Any]:
         if not batch:
             return {}
 
         first = batch[0]
-        result: Dict[str, torch.Tensor] = {}
+        result: Dict[str, Any] = {}
 
         for key in first:
             vals = [sample[key] for sample in batch]

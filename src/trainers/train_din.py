@@ -15,8 +15,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.amp import autocast
-from torch.amp import GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -100,6 +100,7 @@ def train_one_epoch(
     use_amp = tcfg["use_amp"] and device.type == "cuda"
     grad_clip = tcfg["grad_clip_norm"]
     log_every = tcfg["log_every_n_steps"]
+    ads_debug_every = int(tcfg.get("ads_debug_every_n_steps", 0))
 
     running_loss = 0.0
     batch_count = 0
@@ -114,6 +115,7 @@ def train_one_epoch(
         dynamic_ncols=True,
     )
 
+    batch_idx = -1
     for batch_idx, batch in enumerate(pbar):
         batch = to_device(batch, device)
         label = batch[config["fields"]["label_col"]].float()  # [B]
@@ -137,6 +139,22 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad()
             global_step += 1
+
+            # 可选 ADS 调试日志：用于观察 PCRG 是否发生兴趣塌缩
+            if ads_debug_every > 0 and global_step % ads_debug_every == 0 and hasattr(model, "get_and_reset_debug_stats"):
+                debug_stats = model.get_and_reset_debug_stats()
+                if debug_stats:
+                    logger.info(
+                        "ADS Debug | variant=%s | din_entropy=%.4f | pcrg_entropy=%.4f | "
+                        "pcrg_var=%.6f | all_pad(din/psrg/pcrg)=%d/%d/%d",
+                        debug_stats.get("variant", "-"),
+                        float(debug_stats.get("din_attn_entropy_mean", 0.0)),
+                        float(debug_stats.get("pcrg_attn_entropy_mean", 0.0)),
+                        float(debug_stats.get("pcrg_query_interest_var", 0.0)),
+                        int(debug_stats.get("din_all_pad_count", 0)),
+                        int(debug_stats.get("psrg_all_pad_count", 0)),
+                        int(debug_stats.get("pcrg_all_pad_count", 0)),
+                    )
 
         step_loss = loss.item() * accum_steps
         running_loss += step_loss
@@ -321,7 +339,7 @@ def sanity_check_forward(
 # 指标比较
 # ─────────────────────────────────────────────────────────────
 
-def is_better(current: float, best: float, metric_name: str) -> bool:
+def is_better(current: float, best: Optional[float], metric_name: str) -> bool:
     """判断当前指标是否优于历史最佳。logloss 越小越好，其余越大越好。"""
     if best is None:
         return True

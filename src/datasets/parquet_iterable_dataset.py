@@ -193,6 +193,7 @@ class ParquetIterableDataset(IterableDataset):
             self.float_columns = _detect_float_columns(pf.schema_arrow) & set(columns)
         else:
             self.float_columns = float_columns & set(columns)
+        self.string_columns = _detect_string_columns(pf.schema_arrow) & set(columns)
 
         logger.info(
             "ParquetIterableDataset 初始化: path=%s, rows=%d, row_groups=%d, cols=%d, "
@@ -239,6 +240,11 @@ class ParquetIterableDataset(IterableDataset):
 
             elif col_name in self.float_columns:
                 arrays[col_name] = column.to_numpy(zero_copy_only=False).astype(np.float32)
+
+            elif col_name in self.string_columns:
+                # 字符串元数据列（如 meta_log_source）保持 object/string，
+                # 下游 collate 会保留为 Python list，不参与 tensor 化。
+                arrays[col_name] = column.to_numpy(zero_copy_only=False).astype(object)
 
             else:
                 # 整型（含 label / sparse / meta 等）→ int64
@@ -346,6 +352,7 @@ class DebugMapDataset(Dataset):
         pf = pq.ParquetFile(parquet_path)
         list_cols = _detect_list_columns(pf.schema_arrow) & set(columns)
         float_cols = _detect_float_columns(pf.schema_arrow) & set(columns)
+        string_cols = _detect_string_columns(pf.schema_arrow) & set(columns)
 
         # 只读前 N 行
         table = pf.read_row_groups(list(range(min(1, pf.metadata.num_row_groups))), columns=columns)
@@ -361,6 +368,8 @@ class DebugMapDataset(Dataset):
                 self.data[col] = np.stack(df[col].values).astype(np.int64)
             elif col in float_cols:
                 self.data[col] = df[col].values.astype(np.float32)
+            elif col in string_cols:
+                self.data[col] = df[col].astype(str).values
             else:
                 self.data[col] = df[col].values.astype(np.int64)
 
@@ -375,5 +384,6 @@ class DebugMapDataset(Dataset):
             if arr.ndim == 2:
                 sample[col] = arr[idx]
             else:
-                sample[col] = arr[idx].item()
+                val = arr[idx]
+                sample[col] = val.item() if hasattr(val, "item") else val
         return sample
