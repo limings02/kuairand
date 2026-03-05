@@ -163,7 +163,7 @@ training:
 # DataLoader 配置
 # --------------------------------------------------
 dataloader:
-  num_workers: 2
+  num_workers: 0
   pin_memory: true
   # shuffle_buffer_size: 跨 row group 的 shuffle buffer 大小
   # 0 = 仅在 row group 内部 shuffle（最省内存，推荐）
@@ -176,7 +176,7 @@ dataloader:
 # --------------------------------------------------
 eval:
   batch_size: 512
-  num_workers: 2
+  num_workers: 0
   # 内存保护：preds/labels/user_ids 累积超过此大小时自动落盘
   memory_threshold_gb: 2.0
 

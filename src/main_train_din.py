@@ -218,6 +218,13 @@ def build_dataloader(
     # ── 默认：IterableDataset（预组装 batch）──
     # Dataset 内部已按 batch_size 切分，yield dict[str, np.ndarray]
     # DataLoader 使用 batch_size=None 直接透传
+    if os.name == "nt" and num_workers > 0:
+        logger.warning(
+            "Windows + 预组装 batch 场景下，num_workers>0 常因进程间传输开销导致变慢；"
+            "已自动回退为 num_workers=0。"
+        )
+        num_workers = 0
+
     dataset = ParquetIterableDataset(
         parquet_path=parquet_path,
         columns=columns,
