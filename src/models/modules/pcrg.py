@@ -189,6 +189,9 @@ class PCRGLite(nn.Module):
             "attn_entropy_mean": entropy.mean().detach(),
             "query_interest_var": interest_var.detach(),
             "all_pad_count": int(all_pad.sum().item()),
+            # 将多兴趣 token 显式返回给上层，便于后续 TransformerFusion 继续建模。
+            "interest_tokens": z,
+            "interest_mask": torch.ones(B, self.num_queries, device=hist_repr.device, dtype=hist_mask.dtype),
         }
         if alpha_g is not None:
             aux["pool_alpha_mean"] = alpha_g.mean().detach()

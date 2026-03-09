@@ -146,14 +146,19 @@ def train_one_epoch(
                 if debug_stats:
                     logger.info(
                         "ADS Debug | variant=%s | din_entropy=%.4f | pcrg_entropy=%.4f | "
-                        "pcrg_var=%.6f | all_pad(din/psrg/pcrg)=%d/%d/%d",
+                        "pcrg_var=%.6f | tf_entropy=%.4f | tf_token_mean=%.6f | tf_token_var=%.6f | "
+                        "all_pad(din/psrg/pcrg/tf)=%d/%d/%d/%d",
                         debug_stats.get("variant", "-"),
                         float(debug_stats.get("din_attn_entropy_mean", 0.0)),
                         float(debug_stats.get("pcrg_attn_entropy_mean", 0.0)),
                         float(debug_stats.get("pcrg_query_interest_var", 0.0)),
+                        float(debug_stats.get("transformer_attn_entropy_mean", 0.0)),
+                        float(debug_stats.get("transformer_token_mean", 0.0)),
+                        float(debug_stats.get("transformer_token_var", 0.0)),
                         int(debug_stats.get("din_all_pad_count", 0)),
                         int(debug_stats.get("psrg_all_pad_count", 0)),
                         int(debug_stats.get("pcrg_all_pad_count", 0)),
+                        int(debug_stats.get("transformer_all_pad_count", 0)),
                     )
 
         step_loss = loss.item() * accum_steps

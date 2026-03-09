@@ -1,10 +1,11 @@
 """
 DIN 及 ADS-lite（PSRG + PCRG）实现。
 
-本文件在原 DIN baseline 基础上做增量扩展，支持三种变体：
+本文件在原 DIN baseline 基础上做增量扩展，支持四种变体：
 1) din               : 原始 DIN
 2) din_psrg          : 历史先经 PSRG-lite，再走单 query DIN attention
 3) din_psrg_pcrg     : 历史经 PSRG-lite + PCRG-lite 多 query attention
+4) din_psrg_pcrg_transformer : 在 PSRG + PCRG 之上追加 TransformerFusion
 
 设计原则
 ────────
@@ -25,6 +26,8 @@ import torch.nn as nn
 from src.models.modules.domain_context import DomainContextEncoder
 from src.models.modules.pcrg import PCRGLite
 from src.models.modules.psrg import PSRGLite
+from src.models.modules.target_attention_dnn import TargetAttentionDNN
+from src.models.modules.transformer_fusion import TransformerFusion
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +180,13 @@ class DINModel(nn.Module):
         self.large_sparse_threshold = int(mcfg.get("large_sparse_threshold", 100))
 
         self.variant = str(mcfg.get("variant", "din")).lower()
-        if self.variant not in {"din", "din_psrg", "din_psrg_pcrg"}:
+        if self.variant not in {"din", "din_psrg", "din_psrg_pcrg", "din_psrg_pcrg_transformer"}:
             raise ValueError(f"不支持的 model.variant={self.variant}")
 
         self.psrg_cfg = mcfg.get("psrg", {})
         self.pcrg_cfg = mcfg.get("pcrg", {})
         self.fusion_cfg = mcfg.get("fusion", {})
+        self.transformer_cfg = mcfg.get("transformer_fusion", {})
         self.domain_cfg = mcfg.get("domain_context", {})
         self.hist_repr_cfg = mcfg.get("hist_repr", {})
         self.cand_repr_cfg = mcfg.get("cand_repr", {})
@@ -250,9 +254,10 @@ class DINModel(nn.Module):
 
         # ── 3) DIN attention（主干保留）──
         din_cfg = mcfg.get("din", {})
-        self.din_attention = DINAttention(
+        self.din_attention = TargetAttentionDNN(
             item_dim=self.item_repr_dim,
             hidden_units=list(din_cfg.get("att_hidden_units", mcfg.get("att_hidden_units", [64, 32]))),
+            activation="prelu",
         )
 
         # ── 4) 历史 optional 特征融合（可选）──
@@ -331,11 +336,11 @@ class DINModel(nn.Module):
 
         # ── 7) PSRG/PCRG 分支配置 ──
         self.psrg_enabled = (
-            self.variant in {"din_psrg", "din_psrg_pcrg"}
+            self.variant in {"din_psrg", "din_psrg_pcrg", "din_psrg_pcrg_transformer"}
             and bool(self.psrg_cfg.get("enabled", True))
         )
         self.pcrg_enabled = (
-            self.variant == "din_psrg_pcrg"
+            self.variant in {"din_psrg_pcrg", "din_psrg_pcrg_transformer"}
             and bool(self.pcrg_cfg.get("enabled", True))
         )
 
@@ -384,7 +389,59 @@ class DINModel(nn.Module):
         if self.pcrg_enabled and self.fusion_mode == "concat" and self.proj_after_concat:
             self.fusion_concat_proj = nn.Linear(2 * self.item_repr_dim, self.item_repr_dim)
 
-        # ── 9) DNN 塔 ──
+        # ── 9) TransformerFusion（可开关，默认推荐 interest 模式）──
+        self.transformer_enabled = bool(
+            self.transformer_cfg.get("enabled", self.variant == "din_psrg_pcrg_transformer")
+        )
+        self.transformer_input = str(self.transformer_cfg.get("fusion_input", "interest")).lower()
+        self.transformer_merge_mode = str(self.transformer_cfg.get("fusion_mode", "concat")).lower()
+        self.transformer_proj_after_concat = bool(self.transformer_cfg.get("proj_after_concat", True))
+        self.transformer_output_dim = int(self.transformer_cfg.get("output_dim", self.item_repr_dim))
+        self.transformer_use_target_attention = bool(self.transformer_cfg.get("use_target_attention", True))
+        self.transformer_fusion: Optional[TransformerFusion] = None
+        self.transformer_concat_proj: Optional[nn.Linear] = None
+
+        if self.transformer_enabled:
+            if self.transformer_input not in {"sequence", "interest"}:
+                raise ValueError(
+                    f"transformer_fusion.fusion_input={self.transformer_input} 非法，仅支持 sequence / interest"
+                )
+            if self.transformer_merge_mode not in {"replace", "concat", "residual_add"}:
+                raise ValueError(
+                    "transformer_fusion.fusion_mode 非法，仅支持 replace / concat / residual_add"
+                )
+            if self.transformer_input == "interest" and not self.pcrg_enabled:
+                raise ValueError("fusion_input=interest 依赖 PCRG 产生多兴趣 token，请启用 pcrg")
+
+            base_interest_dim = self._base_interest_output_dim()
+            if self.transformer_merge_mode == "residual_add" and base_interest_dim != self.transformer_output_dim:
+                raise ValueError(
+                    "transformer_fusion.fusion_mode=residual_add 要求 original_interest 与 u_fused 维度一致，"
+                    f"当前 {base_interest_dim} vs {self.transformer_output_dim}"
+                )
+
+            self.transformer_fusion = TransformerFusion(
+                input_dim=self.item_repr_dim,
+                query_dim=self.item_repr_dim,
+                d_model=int(self.transformer_cfg.get("d_model", self.item_repr_dim)),
+                output_dim=self.transformer_output_dim,
+                n_layers=int(self.transformer_cfg.get("n_layers", 1)),
+                n_heads=int(self.transformer_cfg.get("n_heads", 2)),
+                dropout=float(self.transformer_cfg.get("dropout", 0.1)),
+                target_att_hidden_units=list(self.transformer_cfg.get("target_att_hidden_units", [64, 32])),
+                target_att_dropout=float(self.transformer_cfg.get("target_att_dropout", 0.1)),
+                ffn_hidden=int(self.transformer_cfg.get("ffn_hidden", 256)),
+                activation=str(self.transformer_cfg.get("activation", "gelu")),
+                use_layernorm=bool(self.transformer_cfg.get("layernorm", True)),
+                use_target_attention=self.transformer_use_target_attention,
+            )
+            if self.transformer_merge_mode == "concat" and self.transformer_proj_after_concat:
+                self.transformer_concat_proj = nn.Linear(
+                    base_interest_dim + self.transformer_output_dim,
+                    base_interest_dim,
+                )
+
+        # ── 10) DNN 塔 ──
         dnn_input_dim = self._calc_dnn_input_dim()
         dnn_hidden_units = list(mcfg.get("dnn_hidden_units", [256, 128, 64]))
         dnn_dropout = float(mcfg.get("dnn_dropout", 0.1))
@@ -404,12 +461,22 @@ class DINModel(nn.Module):
         self.dnn = nn.Sequential(*layers)
 
         logger.info(
-            "模型变体: variant=%s | psrg=%s | pcrg=%s | fusion=%s",
+            "模型变体: variant=%s | psrg=%s | pcrg=%s | fusion=%s | transformer=%s",
             self.variant,
             self.psrg_enabled,
             self.pcrg_enabled,
             self.fusion_mode if self.pcrg_enabled else "none",
+            self.transformer_enabled,
         )
+        if self.transformer_enabled:
+            logger.info(
+                "TransformerFusion 配置: input=%s | layers=%d | heads=%d | fusion_mode=%s | target_att=%s",
+                self.transformer_input,
+                int(self.transformer_cfg.get("n_layers", 1)),
+                int(self.transformer_cfg.get("n_heads", 2)),
+                self.transformer_merge_mode,
+                self.transformer_use_target_attention,
+            )
         logger.info("DNN 输入维度: %d", dnn_input_dim)
 
         total_params = sum(p.numel() for p in self.parameters())
@@ -453,10 +520,28 @@ class DINModel(nn.Module):
         emb_dim = self._get_emb_dim(vocab_name)
         self.sparse_embeddings[col_name] = nn.Embedding(vs, emb_dim, padding_idx=0)
 
-    def _interest_output_dim(self) -> int:
+    def _base_interest_output_dim(self) -> int:
         if self.pcrg_enabled and self.fusion_mode == "concat" and not self.proj_after_concat:
             return 2 * self.item_repr_dim
         return self.item_repr_dim
+
+    def _interest_output_dim(self) -> int:
+        base_dim = self._base_interest_output_dim()
+        if not self.transformer_enabled:
+            return base_dim
+
+        if self.transformer_merge_mode == "replace":
+            return self.transformer_output_dim
+
+        if self.transformer_merge_mode == "concat":
+            if self.transformer_proj_after_concat:
+                return base_dim
+            return base_dim + self.transformer_output_dim
+
+        if self.transformer_merge_mode == "residual_add":
+            return base_dim
+
+        raise ValueError(f"不支持的 transformer_fusion.fusion_mode={self.transformer_merge_mode}")
 
     def _calc_dnn_input_dim(self) -> int:
         dim = 0
@@ -631,6 +716,27 @@ class DINModel(nn.Module):
 
         raise ValueError(f"不支持的 fusion.mode={self.fusion_mode}")
 
+    def _fuse_transformer_interest(self, original_interest: torch.Tensor, u_fused: torch.Tensor) -> torch.Tensor:
+        """将 TransformerFusion 输出与原 user_interest 再做一次融合。"""
+        if self.transformer_merge_mode == "replace":
+            return u_fused
+
+        if self.transformer_merge_mode == "concat":
+            fused = torch.cat([original_interest, u_fused], dim=-1)
+            if self.transformer_concat_proj is not None:
+                fused = self.transformer_concat_proj(fused)
+            return fused
+
+        if self.transformer_merge_mode == "residual_add":
+            if original_interest.shape[-1] != u_fused.shape[-1]:
+                raise ValueError(
+                    "transformer_fusion.fusion_mode=residual_add 要求维度一致，"
+                    f"当前 {original_interest.shape[-1]} vs {u_fused.shape[-1]}"
+                )
+            return original_interest + u_fused
+
+        raise ValueError(f"不支持的 transformer_fusion.fusion_mode={self.transformer_merge_mode}")
+
     # ─────────────────────────────────────────────────────────
     # forward
     # ─────────────────────────────────────────────────────────
@@ -675,6 +781,26 @@ class DINModel(nn.Module):
         else:
             user_interest = user_interest_din
 
+        # ── 路径 D: TransformerFusion（在现有兴趣表示之上做进一步增强）──
+        transformer_aux: Dict[str, Any] = {}
+        if self.transformer_enabled and self.transformer_fusion is not None:
+            fusion_tokens = hist_for_attn
+            fusion_mask = hist_mask
+
+            if self.transformer_input == "interest":
+                fusion_tokens = pcrg_aux.get("interest_tokens")
+                fusion_mask = pcrg_aux.get("interest_mask")
+                if fusion_tokens is None:
+                    raise RuntimeError("TransformerFusion interest 模式需要 PCRG 提供 interest_tokens")
+
+            u_fused, transformer_aux = self.transformer_fusion(
+                query=cand_item_repr,
+                tokens=fusion_tokens,
+                token_mask=fusion_mask,
+                return_debug=True,
+            )
+            user_interest = self._fuse_transformer_interest(user_interest, u_fused)
+
         # ── 拼接进入最终 DNN ──
         parts = [user_interest, cand_item_repr]
 
@@ -710,6 +836,14 @@ class DINModel(nn.Module):
                 pcrg_aux.get("query_interest_var", torch.tensor(0.0)).item()
             ) if pcrg_aux else 0.0,
             "pcrg_all_pad_count": int(pcrg_aux.get("all_pad_count", 0)) if pcrg_aux else 0,
+            "transformer_token_mean": float(transformer_aux.get("token_mean", 0.0)) if transformer_aux else 0.0,
+            "transformer_token_var": float(transformer_aux.get("token_var", 0.0)) if transformer_aux else 0.0,
+            "transformer_attn_entropy_mean": float(
+                transformer_aux.get("target_attn_entropy_mean", 0.0)
+            ) if transformer_aux else 0.0,
+            "transformer_all_pad_count": int(
+                transformer_aux.get("target_all_pad_count", 0)
+            ) if transformer_aux else 0,
         }
 
         # debug 模式下仅首个 batch 打印关键 shape

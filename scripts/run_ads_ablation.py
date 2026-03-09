@@ -7,6 +7,7 @@ ADS-lite ablation 运行脚本。
   - DIN + PSRG
   - DIN + PSRG + PCRG (G=2/4/8)
   - DIN + PSRG + PCRG + mean_pool vs attn_pool_over_G
+  - DIN + PSRG + PCRG + TransformerFusion（interest / sequence / 去掉 Step1 / 去掉 target-att）
 
 用法示例：
   python scripts/run_ads_ablation.py \
@@ -108,6 +109,82 @@ def build_experiments() -> list[dict]:
                     "variant": "din_psrg_pcrg",
                     "psrg": {"enabled": True},
                     "pcrg": {"enabled": True, "num_queries": 4, "aggregation": "attn_pool_over_G"},
+                },
+            },
+        },
+        {
+            "name": "din_psrg_pcrg_transformer_interest",
+            "updates": {
+                "model": {
+                    "variant": "din_psrg_pcrg_transformer",
+                    "psrg": {"enabled": True},
+                    "pcrg": {"enabled": True, "num_queries": 4, "aggregation": "mean_pool"},
+                    "transformer_fusion": {
+                        "enabled": True,
+                        "fusion_input": "interest",
+                        "n_layers": 1,
+                        "n_heads": 2,
+                        "use_target_attention": True,
+                        "fusion_mode": "concat",
+                        "proj_after_concat": True,
+                    },
+                },
+            },
+        },
+        {
+            "name": "din_psrg_pcrg_transformer_sequence",
+            "updates": {
+                "model": {
+                    "variant": "din_psrg_pcrg_transformer",
+                    "psrg": {"enabled": True},
+                    "pcrg": {"enabled": True, "num_queries": 4, "aggregation": "mean_pool"},
+                    "transformer_fusion": {
+                        "enabled": True,
+                        "fusion_input": "sequence",
+                        "n_layers": 1,
+                        "n_heads": 2,
+                        "use_target_attention": True,
+                        "fusion_mode": "concat",
+                        "proj_after_concat": True,
+                    },
+                },
+            },
+        },
+        {
+            "name": "din_psrg_pcrg_transformer_interest_no_step1",
+            "updates": {
+                "model": {
+                    "variant": "din_psrg_pcrg_transformer",
+                    "psrg": {"enabled": True},
+                    "pcrg": {"enabled": True, "num_queries": 4, "aggregation": "mean_pool"},
+                    "transformer_fusion": {
+                        "enabled": True,
+                        "fusion_input": "interest",
+                        "n_layers": 0,
+                        "n_heads": 2,
+                        "use_target_attention": True,
+                        "fusion_mode": "concat",
+                        "proj_after_concat": True,
+                    },
+                },
+            },
+        },
+        {
+            "name": "din_psrg_pcrg_transformer_interest_no_target_att",
+            "updates": {
+                "model": {
+                    "variant": "din_psrg_pcrg_transformer",
+                    "psrg": {"enabled": True},
+                    "pcrg": {"enabled": True, "num_queries": 4, "aggregation": "mean_pool"},
+                    "transformer_fusion": {
+                        "enabled": True,
+                        "fusion_input": "interest",
+                        "n_layers": 1,
+                        "n_heads": 2,
+                        "use_target_attention": False,
+                        "fusion_mode": "concat",
+                        "proj_after_concat": True,
+                    },
                 },
             },
         },

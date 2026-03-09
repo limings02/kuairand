@@ -65,7 +65,12 @@ def parse_args():
     p.add_argument("--device", type=str, default=None, help="覆盖 device (auto/cuda/cpu)")
     p.add_argument("--epochs", type=int, default=None, help="覆盖训练 epoch 数")
     p.add_argument("--batch_size", type=int, default=None, help="覆盖训练 batch_size")
-    p.add_argument("--model_variant", type=str, default=None, help="覆盖 model.variant: din / din_psrg / din_psrg_pcrg")
+    p.add_argument(
+        "--model_variant",
+        type=str,
+        default=None,
+        help="覆盖 model.variant: din / din_psrg / din_psrg_pcrg / din_psrg_pcrg_transformer",
+    )
     p.add_argument("--num_queries", type=int, default=None, help="覆盖 model.pcrg.num_queries")
     p.add_argument("--pcrg_aggregation", type=str, default=None, help="覆盖 model.pcrg.aggregation")
     p.add_argument("--eval_only", action="store_true", help="仅评估（跳过训练，加载 best checkpoint）")
@@ -90,6 +95,7 @@ def load_config(args) -> dict:
     config.setdefault("model", {})
     config["model"].setdefault("psrg", {})
     config["model"].setdefault("pcrg", {})
+    config["model"].setdefault("transformer_fusion", {})
 
     # CLI 覆盖
     if args.data_root:
@@ -341,12 +347,18 @@ def main():
     logger.info("DIN Baseline 训练启动")
     logger.info("实验目录: %s", run_dir)
     logger.info(
-        "模型配置: variant=%s | psrg.enabled=%s | pcrg.enabled=%s | pcrg.num_queries=%s | pcrg.aggregation=%s",
+        "模型配置: variant=%s | psrg.enabled=%s | pcrg.enabled=%s | pcrg.num_queries=%s | "
+        "pcrg.aggregation=%s | tf.enabled=%s | tf.input=%s | tf.layers=%s | tf.heads=%s | tf.fusion_mode=%s",
         config.get("model", {}).get("variant", "din"),
         config.get("model", {}).get("psrg", {}).get("enabled", False),
         config.get("model", {}).get("pcrg", {}).get("enabled", False),
         config.get("model", {}).get("pcrg", {}).get("num_queries", "-"),
         config.get("model", {}).get("pcrg", {}).get("aggregation", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("enabled", False),
+        config.get("model", {}).get("transformer_fusion", {}).get("fusion_input", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("n_layers", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("n_heads", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("fusion_mode", "-"),
     )
     logger.info("=" * 70)
 
