@@ -372,3 +372,56 @@ python -m src.main_train_din `
 
 # 冒烟测试（1 个 batch forward+backward）
 python scripts/smoke_test_din.py
+
+---
+
+## 三、实验结果一键汇总（run 对比 + tab 报表）
+
+新增脚本：`src/analysis/summarize_experiments.py`
+
+用途：
+- 扫描 `runs_root` 下所有 run，自动识别配置快照、checkpoint、metrics 文件路径；
+- 汇总 overall 指标（val / test_standard / test_random 的 AUC / LogLoss / GAUC）；
+- 汇总 tab 指标并生成 baseline 对比（`ΔGAUC`）；
+- 可选重算缺失的 tab 指标（流式评估，适配 16GB 内存）。
+
+### 仅汇总（不重算 tab）
+
+```bash
+python -m src.analysis.summarize_experiments \
+  --runs_root output/exp_runs \
+  --output_dir output/analysis/exp_summary \
+  --baseline_run din_baseline_mlp_v1
+```
+
+### 缺失 tab 指标时重算
+
+```bash
+python -m src.analysis.summarize_experiments \
+  --runs_root output/exp_runs \
+  --output_dir output/analysis/exp_summary \
+  --baseline_run din_baseline_mlp_v1 \
+  --recompute_tab_metrics true \
+  --processed_root output/processed \
+  --vocabs_root output/vocabs \
+  --meta_root output/meta \
+  --device cuda
+```
+
+### 常用筛选参数
+
+- `--include_patterns`: 仅包含匹配 run（支持通配符/逗号分隔）
+- `--exclude_patterns`: 排除匹配 run
+- `--max_runs`: 限制最多处理 run 数量
+- `--debug`: 仅处理前几个 run（配合 `--debug_max_runs`）
+- `--save_plots true/false`: 是否保存图表
+
+### 输出产物（默认 `output/analysis/exp_summary/`）
+
+- `overall_summary.csv` / `overall_summary.md`
+- `tab_summary_standard.csv` / `tab_summary_standard.md`
+- `tab_summary_random.csv` / `tab_summary_random.md`（若 random 有 tab 指标）
+- `delta_vs_baseline.csv` / `delta_vs_baseline.md`
+- `overall_gauc_compare.png`（可选）
+- `tab_delta_gauc_standard.png`（可选）
+- `tab_delta_gauc_random.png`（可选）
