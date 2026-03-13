@@ -1,0 +1,252 @@
+# ============================================================================
+# KuaiRand-27K  DIN + ADS-lite + Transformer + MBCNet Head 训练配置
+# 目标环境: 16GB RAM + 4GB GPU
+# ============================================================================
+
+data:
+  data_root: "output/processed"
+  meta_root: "output/meta"
+  vocabs_root: "output/vocabs"
+
+  train_file: "train.parquet"
+  val_file: "val.parquet"
+  test_standard_file: "test_standard.parquet"
+  test_random_file: "test_random.parquet"
+
+  field_schema_file: "field_schema.json"
+  vocab_manifest_file: "feature_vocab_manifest.json"
+
+fields:
+  label_col: "label_long_view"
+  user_id_col: "user_id_raw"
+
+  meta_cols:
+    - "user_id_raw"
+    - "meta_is_rand"
+    - "sample_time_ms"
+    - "meta_log_source"
+
+  hist_seq_cols:
+    - "hist_video_id"
+    - "hist_author_id"
+  hist_mask_col: "hist_mask"
+  hist_len_col: "hist_len"
+
+  optional_hist_seq_cols:
+    - "hist_delta_t_bucket"
+    - "hist_play_ratio_bucket"
+    - "hist_tab"
+
+  cand_cols:
+    video_id: "cand_video_id"
+    author_id: "cand_author_id"
+    video_type: "cand_video_type"
+    upload_type: "cand_upload_type"
+    duration_bucket: "cand_video_duration_bucket"
+
+  context_sparse_cols:
+    - "tab"
+    - "hour_of_day"
+    - "day_of_week"
+    - "is_weekend"
+
+  user_sparse_cols:
+    - "user_active_degree"
+    - "is_lowactive_period"
+    - "is_live_streamer"
+    - "is_video_author"
+    - "follow_user_num_range"
+    - "fans_user_num_range"
+    - "friend_user_num_range"
+    - "register_days_range"
+    - "onehot_feat0"
+    - "onehot_feat1"
+    - "onehot_feat2"
+    - "onehot_feat3"
+    - "onehot_feat4"
+    - "onehot_feat5"
+    - "onehot_feat6"
+    - "onehot_feat7"
+    - "onehot_feat8"
+    - "onehot_feat9"
+    - "onehot_feat10"
+    - "onehot_feat11"
+    - "onehot_feat12"
+    - "onehot_feat13"
+    - "onehot_feat14"
+    - "onehot_feat15"
+    - "onehot_feat16"
+    - "onehot_feat17"
+
+  user_dense_cols:
+    - "log1p_follow_user_num"
+    - "log1p_fans_user_num"
+    - "log1p_friend_user_num"
+    - "log1p_register_days"
+
+model:
+  name: "DIN"
+  variant: "din_psrg_pcrg_transformer"
+  max_hist_len: 50
+
+  emb_dims:
+    video_id: 32
+    author_id: 16
+    small_cat: 4
+
+  use_hash_embedding: true
+  video_id_hash_buckets: 1000000
+  author_id_hash_buckets: 500000
+  large_sparse_emb_dim: 8
+  large_sparse_threshold: 100
+
+  din:
+    att_hidden_units: [64, 32]
+
+  hist_repr:
+    use_hist_tab: false
+    use_hist_delta_t_bucket: false
+    use_hist_play_ratio_bucket: false
+
+  cand_repr:
+    fuse_side_into_item: false
+    use_video_type: true
+    use_upload_type: true
+    use_video_duration_bucket: true
+
+  domain_context:
+    use_hour_of_day: true
+    use_day_of_week: true
+    use_user_context: false
+    hidden_units: [64]
+    output_dim: 48
+    dropout: 0.1
+    layernorm: true
+
+  psrg:
+    enabled: true
+    mode: "gated_residual"
+    hidden_units: [64]
+    layernorm: true
+    use_hist_tab_in_psrg: true
+    use_current_tab_always: true
+    dropout: 0.1
+
+  pcrg:
+    enabled: true
+    num_queries: 4
+    query_dim: 48
+    score_type: "din_mlp"
+    hidden_units: [64, 32]
+    aggregation: "mean_pool"
+    dropout: 0.1
+
+  fusion:
+    mode: "concat"
+    proj_after_concat: true
+
+  transformer_fusion:
+    enabled: true
+    fusion_input: "interest"
+    n_layers: 1
+    n_heads: 2
+    d_model: 48
+    dropout: 0.1
+    target_att_hidden_units: [64, 32]
+    target_att_dropout: 0.1
+    use_target_attention: true
+    ffn_hidden: 256
+    activation: "gelu"
+    layernorm: true
+    output_dim: 48
+    fusion_mode: "concat"
+    proj_after_concat: true
+
+  # 基线 MLP head 参数（head.type=mlp 时生效）
+  dnn_hidden_units: [256, 128, 64]
+  dnn_dropout: 0.1
+  dnn_use_bn: true
+
+  # 新增：可切换 head
+  head:
+    type: "mbcnet"  # mlp | mbcnet
+    mbcnet:
+      enable_fgc: true
+      enable_lowrank_cross: true
+      enable_deep: true
+
+      # 按语义字段默认分组（字段名来自模型内部 feature_slices）
+      feature_groups:
+        - "user_interest"
+        - "cand_repr"
+        - "user_profile_sparse_embs"
+        - "user_dense"
+        - "context_embs"
+        - "candidate_side_embs"
+      fallback_num_groups: 4
+
+      # FGC 分支
+      fgc:
+        num_layers: 1
+        mode: "cross1"   # cross1 | bilinear | gated
+        dropout: 0.1
+        layernorm: true
+
+      # Low-rank Cross 分支
+      lowrank_cross:
+        num_layers: 2
+        rank: 16
+        dropout: 0.1
+        layernorm: true
+
+      # Deep 分支
+      deep:
+        hidden_units: [256, 128, 64]
+        activation: "gelu"
+        dropout: 0.1
+        layernorm: false
+
+      # 分支融合
+      fusion:
+        branch_proj_dim: 128
+        mode: "concat_then_mlp"  # concat_then_mlp | weighted_sum
+        final_mlp: [128, 64]
+        dropout: 0.1
+
+  debug:
+    print_shapes_once: true
+
+training:
+  epochs: 5
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  optimizer: "adamw"
+
+  use_amp: true
+  gradient_accum_steps: 1
+  grad_clip_norm: 5.0
+
+  log_every_n_steps: 200
+  ads_debug_every_n_steps: 200
+
+  eval_every_n_steps: 0
+  patience: 3
+  monitor_metric: "gauc"
+  save_best_only: true
+
+dataloader:
+  num_workers: 0
+  pin_memory: true
+  shuffle_buffer_size: 0
+  prefetch_factor: 2
+
+eval:
+  batch_size: 512
+  num_workers: 0
+  memory_threshold_gb: 2.0
+
+seed: 42
+device: "auto"
+run_name: "din_ads_lite_psrg_pcrg_transformer_mbcnet"
+

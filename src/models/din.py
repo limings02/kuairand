@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 
 from src.models.modules.domain_context import DomainContextEncoder
+from src.models.modules.feature_slices import build_feature_slices
+from src.models.modules.mbcnet import MBCNetHead
 from src.models.modules.pcrg import PCRGLite
 from src.models.modules.psrg import PSRGLite
 from src.models.modules.target_attention_dnn import TargetAttentionDNN
@@ -190,7 +192,12 @@ class DINModel(nn.Module):
         self.domain_cfg = mcfg.get("domain_context", {})
         self.hist_repr_cfg = mcfg.get("hist_repr", {})
         self.cand_repr_cfg = mcfg.get("cand_repr", {})
+        self.head_cfg = mcfg.get("head", {})
+        self.head_type = str(self.head_cfg.get("type", "mlp")).lower()
+        self.mbcnet_cfg = self.head_cfg.get("mbcnet", {})
         self.debug_cfg = mcfg.get("debug", {})
+        if self.head_type not in {"mlp", "mbcnet"}:
+            raise ValueError(f"不支持的 model.head.type={self.head_type}，仅支持 mlp / mbcnet")
 
         # 仅打印一次的 warning/shape 调试标记
         self._warned_messages: set[str] = set()
@@ -441,24 +448,28 @@ class DINModel(nn.Module):
                     base_interest_dim,
                 )
 
-        # ── 10) DNN 塔 ──
-        dnn_input_dim = self._calc_dnn_input_dim()
-        dnn_hidden_units = list(mcfg.get("dnn_hidden_units", [256, 128, 64]))
-        dnn_dropout = float(mcfg.get("dnn_dropout", 0.1))
-        dnn_use_bn = bool(mcfg.get("dnn_use_bn", True))
+        # ── 10) 统一 head 输入向量 x 的子块切片 ──
+        # 这里显式维护各子块在 x 中的范围，便于：
+        # 1) MBCNet 按语义字段分组交叉；
+        # 2) debug 时快速定位维度错误；
+        # 3) 保持上游特征接口不变，仅替换最后 head。
+        self.feature_block_dims = self._calc_feature_block_dims()
+        self.feature_slices = build_feature_slices(self.feature_block_dims)
+        self.head_input_dim = sum(self.feature_block_dims.values())
 
-        layers: list[nn.Module] = []
-        prev_dim = dnn_input_dim
-        for hidden_dim in dnn_hidden_units:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            if dnn_use_bn:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
-            if dnn_dropout > 0:
-                layers.append(nn.Dropout(dnn_dropout))
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, 1))
-        self.dnn = nn.Sequential(*layers)
+        # ── 11) 最终 head：mlp（基线）或 mbcnet（三分支）──
+        self.dnn: Optional[nn.Module] = None
+        self.mbcnet_head: Optional[MBCNetHead] = None
+        if self.head_type == "mlp":
+            self.dnn = self._build_mlp_head(mcfg, self.head_input_dim)
+            self.head: nn.Module = self.dnn
+        else:
+            self.mbcnet_head = MBCNetHead(
+                input_dim=self.head_input_dim,
+                config=self.mbcnet_cfg,
+                feature_slices=self.feature_slices,
+            )
+            self.head = self.mbcnet_head
 
         logger.info(
             "模型变体: variant=%s | psrg=%s | pcrg=%s | fusion=%s | transformer=%s",
@@ -477,7 +488,19 @@ class DINModel(nn.Module):
                 self.transformer_merge_mode,
                 self.transformer_use_target_attention,
             )
-        logger.info("DNN 输入维度: %d", dnn_input_dim)
+        logger.info(
+            "Head 配置: type=%s | input_dim=%d | slices=%s",
+            self.head_type,
+            self.head_input_dim,
+            self.feature_slices,
+        )
+        if self.head_type == "mbcnet" and self.mbcnet_head is not None:
+            logger.info(
+                "MBCNet 配置: branches=%s | fusion=%s | groups=%s",
+                self.mbcnet_head.enabled_branch_names,
+                self.mbcnet_head.fusion_mode,
+                [name for name, _ in self.mbcnet_head.group_slices],
+            )
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -543,31 +566,141 @@ class DINModel(nn.Module):
 
         raise ValueError(f"不支持的 transformer_fusion.fusion_mode={self.transformer_merge_mode}")
 
-    def _calc_dnn_input_dim(self) -> int:
-        dim = 0
-        # user_interest（DIN 或 ADS 融合后）
-        dim += self._interest_output_dim()
-        # cand_item_repr
-        dim += self.item_repr_dim
+    def _calc_feature_block_dims(self) -> Dict[str, int]:
+        """计算最终 head 输入 x 的各语义子块维度。"""
 
-        # cand side
-        for col_name in self.cand_side_cols:
-            if col_name in self.sparse_embeddings:
-                dim += self.sparse_embeddings[col_name].embedding_dim
+        def _sum_sparse_dims(cols: List[str]) -> int:
+            total = 0
+            for col_name in cols:
+                if col_name in self.sparse_embeddings:
+                    total += self.sparse_embeddings[col_name].embedding_dim
+            return total
 
-        # context sparse
-        for col_name in self.context_sparse_cols:
-            if col_name in self.sparse_embeddings:
-                dim += self.sparse_embeddings[col_name].embedding_dim
+        # 默认按 interest/item/user/context/candidate_side 语义分组。
+        return {
+            "user_interest": self._interest_output_dim(),
+            "cand_repr": self.item_repr_dim,
+            "user_profile_sparse_embs": _sum_sparse_dims(self.user_sparse_cols),
+            "user_dense": len(self.user_dense_cols),
+            "context_embs": _sum_sparse_dims(self.context_sparse_cols),
+            "candidate_side_embs": _sum_sparse_dims(self.cand_side_cols),
+        }
 
-        # user sparse
-        for col_name in self.user_sparse_cols:
-            if col_name in self.sparse_embeddings:
-                dim += self.sparse_embeddings[col_name].embedding_dim
+    def _build_mlp_head(self, mcfg: Dict[str, Any], input_dim: int) -> nn.Module:
+        """保留原 baseline MLP head，用于与 MBCNet 做配置级 ablation。"""
+        dnn_hidden_units = list(mcfg.get("dnn_hidden_units", [256, 128, 64]))
+        dnn_dropout = float(mcfg.get("dnn_dropout", 0.1))
+        dnn_use_bn = bool(mcfg.get("dnn_use_bn", True))
 
-        # user dense
-        dim += len(self.user_dense_cols)
-        return dim
+        layers: List[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in dnn_hidden_units:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if dnn_use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            if dnn_dropout > 0:
+                layers.append(nn.Dropout(dnn_dropout))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        return nn.Sequential(*layers)
+
+    def _collect_sparse_block(
+        self,
+        batch: Dict[str, torch.Tensor],
+        cols: List[str],
+        ref: torch.Tensor,
+        block_name: str,
+    ) -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+        for col_name in cols:
+            if col_name not in self.sparse_embeddings:
+                continue
+
+            emb = self.sparse_embeddings[col_name]
+            if col_name in batch:
+                parts.append(emb(batch[col_name]))
+            else:
+                self._warn_once(
+                    f"missing_head_col_{block_name}_{col_name}",
+                    f"head 输入构造缺少字段 '{col_name}'，将用 0 向量占位。",
+                )
+                parts.append(emb.weight.new_zeros((ref.shape[0], emb.embedding_dim)))
+
+        if not parts:
+            return ref.new_zeros((ref.shape[0], 0))
+        return torch.cat(parts, dim=-1)
+
+    def _get_user_dense_fixed(self, batch: Dict[str, torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+        """固定 user_dense 维度，保证 head 输入稳定。"""
+        target_dim = int(self.feature_block_dims.get("user_dense", 0))
+        if target_dim <= 0:
+            return ref.new_zeros((ref.shape[0], 0))
+
+        dense = self._get_user_dense(batch)
+        if dense is None:
+            self._warn_once(
+                "missing_user_dense_for_head",
+                "head 输入构造缺少 user_dense，将用 0 向量占位。",
+            )
+            return ref.new_zeros((ref.shape[0], target_dim))
+
+        if dense.shape[0] != ref.shape[0]:
+            raise ValueError(
+                f"user_dense batch size 与主干不一致: {dense.shape[0]} vs {ref.shape[0]}"
+            )
+
+        cur_dim = dense.shape[-1]
+        if cur_dim == target_dim:
+            return dense
+        if cur_dim > target_dim:
+            self._warn_once(
+                "user_dense_truncate_for_head",
+                f"user_dense 维度({cur_dim}) > 预期({target_dim})，将截断到预期维度。",
+            )
+            return dense[:, :target_dim]
+
+        self._warn_once(
+            "user_dense_pad_for_head",
+            f"user_dense 维度({cur_dim}) < 预期({target_dim})，将右侧补 0。",
+        )
+        pad = ref.new_zeros((ref.shape[0], target_dim - cur_dim))
+        return torch.cat([dense, pad], dim=-1)
+
+    def _build_head_input(
+        self,
+        batch: Dict[str, torch.Tensor],
+        user_interest: torch.Tensor,
+        cand_item_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        """统一拼接最终 flat feature vector x: [B, D_in]。"""
+        user_sparse = self._collect_sparse_block(
+            batch=batch,
+            cols=self.user_sparse_cols,
+            ref=cand_item_repr,
+            block_name="user_profile_sparse_embs",
+        )
+        user_dense = self._get_user_dense_fixed(batch, cand_item_repr)
+        context_embs = self._collect_sparse_block(
+            batch=batch,
+            cols=self.context_sparse_cols,
+            ref=cand_item_repr,
+            block_name="context_embs",
+        )
+        cand_side_embs = self._collect_sparse_block(
+            batch=batch,
+            cols=self.cand_side_cols,
+            ref=cand_item_repr,
+            block_name="candidate_side_embs",
+        )
+
+        parts = [user_interest, cand_item_repr, user_sparse, user_dense, context_embs, cand_side_embs]
+        x = torch.cat(parts, dim=-1)
+        if x.shape[-1] != self.head_input_dim:
+            raise RuntimeError(
+                f"head 输入维度不匹配: 实际={x.shape[-1]} 预期={self.head_input_dim} | slices={self.feature_slices}"
+            )
+        return x
 
     def _validate_hist_shape(self, batch: Dict[str, torch.Tensor]):
         """健壮性检查：hist_video_id / hist_author_id / hist_mask shape 必须一致。"""
@@ -801,31 +934,20 @@ class DINModel(nn.Module):
             )
             user_interest = self._fuse_transformer_interest(user_interest, u_fused)
 
-        # ── 拼接进入最终 DNN ──
-        parts = [user_interest, cand_item_repr]
-
-        for col_name in self.cand_side_cols:
-            if col_name in self.sparse_embeddings and col_name in batch:
-                parts.append(self.sparse_embeddings[col_name](batch[col_name]))
-
-        for col_name in self.context_sparse_cols:
-            if col_name in self.sparse_embeddings and col_name in batch:
-                parts.append(self.sparse_embeddings[col_name](batch[col_name]))
-
-        for col_name in self.user_sparse_cols:
-            if col_name in self.sparse_embeddings and col_name in batch:
-                parts.append(self.sparse_embeddings[col_name](batch[col_name]))
-
-        user_dense = self._get_user_dense(batch)
-        if user_dense is not None:
-            parts.append(user_dense)
-
-        dnn_input = torch.cat(parts, dim=-1)
-        logits = self.dnn(dnn_input).squeeze(-1)
+        # ── 统一 flat 向量 x，再送入可切换 head（MLP / MBCNet）──
+        head_input = self._build_head_input(
+            batch=batch,
+            user_interest=user_interest,
+            cand_item_repr=cand_item_repr,
+        )
+        logits = self.head(head_input)
+        if logits.ndim > 1:
+            logits = logits.squeeze(-1)
 
         # 记录调试统计，供 trainer 可选打印
         self._last_debug_stats = {
             "variant": self.variant,
+            "head_type": self.head_type,
             "din_attn_entropy_mean": din_aux.get("attn_entropy_mean", 0.0),
             "din_all_pad_count": int(din_aux.get("all_pad_count", 0)),
             "psrg_all_pad_count": int(psrg_all_pad_count),
@@ -845,17 +967,23 @@ class DINModel(nn.Module):
                 transformer_aux.get("target_all_pad_count", 0)
             ) if transformer_aux else 0,
         }
+        if self.head_type == "mbcnet" and self.mbcnet_head is not None:
+            self._last_debug_stats.update(self.mbcnet_head.last_debug_stats)
 
         # debug 模式下仅首个 batch 打印关键 shape
         if bool(self.debug_cfg.get("print_shapes_once", False)) and (not self._printed_shape_once):
             self._printed_shape_once = True
             logger.info(
-                "[Debug Shapes] variant=%s | cand_item=%s | hist_item=%s | user_interest=%s | logits=%s",
+                "[Debug Shapes] variant=%s | head=%s | cand_item=%s | hist_item=%s | "
+                "user_interest=%s | x=%s | logits=%s | slices=%s",
                 self.variant,
+                self.head_type,
                 list(cand_item_repr.shape),
                 list(hist_for_attn.shape),
                 list(user_interest.shape),
+                list(head_input.shape),
                 list(logits.shape),
+                self.feature_slices,
             )
 
         return logits

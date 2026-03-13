@@ -360,6 +360,14 @@ def main():
         config.get("model", {}).get("transformer_fusion", {}).get("n_heads", "-"),
         config.get("model", {}).get("transformer_fusion", {}).get("fusion_mode", "-"),
     )
+    logger.info(
+        "Head 配置: type=%s | mbcnet(fgc/lr/deep)=%s/%s/%s | fusion=%s",
+        config.get("model", {}).get("head", {}).get("type", "mlp"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_fgc", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_lowrank_cross", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_deep", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("fusion", {}).get("mode", "-"),
+    )
     logger.info("=" * 70)
 
     # 保存配置快照

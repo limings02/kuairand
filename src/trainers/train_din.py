@@ -160,6 +160,15 @@ def train_one_epoch(
                         int(debug_stats.get("pcrg_all_pad_count", 0)),
                         int(debug_stats.get("transformer_all_pad_count", 0)),
                     )
+                    if "mbcnet_enabled_branches" in debug_stats:
+                        logger.info(
+                            "MBCNet Debug | branches=%s | norms(fgc/lr/deep)=%.6f/%.6f/%.6f | weights=%s",
+                            debug_stats.get("mbcnet_enabled_branches", "-"),
+                            float(debug_stats.get("mbcnet_fgc_norm_mean", 0.0)),
+                            float(debug_stats.get("mbcnet_lowrank_norm_mean", 0.0)),
+                            float(debug_stats.get("mbcnet_deep_norm_mean", 0.0)),
+                            debug_stats.get("mbcnet_branch_weights", []),
+                        )
 
         step_loss = loss.item() * accum_steps
         running_loss += step_loss
