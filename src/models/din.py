@@ -26,7 +26,9 @@ import torch.nn as nn
 from src.models.modules.domain_context import DomainContextEncoder
 from src.models.modules.feature_slices import build_feature_slices
 from src.models.modules.mbcnet import MBCNetHead
+from src.models.modules.personal_context import PersonalContextEncoder
 from src.models.modules.pcrg import PCRGLite
+from src.models.modules.ppnet import PPNet
 from src.models.modules.psrg import PSRGLite
 from src.models.modules.target_attention_dnn import TargetAttentionDNN
 from src.models.modules.transformer_fusion import TransformerFusion
@@ -184,6 +186,7 @@ class DINModel(nn.Module):
         self.variant = str(mcfg.get("variant", "din")).lower()
         if self.variant not in {"din", "din_psrg", "din_psrg_pcrg", "din_psrg_pcrg_transformer"}:
             raise ValueError(f"不支持的 model.variant={self.variant}")
+        self.max_hist_len = int(mcfg.get("max_hist_len", 50))
 
         self.psrg_cfg = mcfg.get("psrg", {})
         self.pcrg_cfg = mcfg.get("pcrg", {})
@@ -195,6 +198,9 @@ class DINModel(nn.Module):
         self.head_cfg = mcfg.get("head", {})
         self.head_type = str(self.head_cfg.get("type", "mlp")).lower()
         self.mbcnet_cfg = self.head_cfg.get("mbcnet", {})
+        self.ppnet_cfg = mcfg.get("ppnet", {})
+        self.ppnet_enabled = bool(self.ppnet_cfg.get("enabled", False))
+        self.ppnet_context_cfg = self.ppnet_cfg.get("context", {})
         self.debug_cfg = mcfg.get("debug", {})
         if self.head_type not in {"mlp", "mbcnet"}:
             raise ValueError(f"不支持的 model.head.type={self.head_type}，仅支持 mlp / mbcnet")
@@ -203,6 +209,11 @@ class DINModel(nn.Module):
         self._warned_messages: set[str] = set()
         self._printed_shape_once = False
         self._last_debug_stats: Dict[str, Any] = {}
+        self.personal_context_encoder: Optional[PersonalContextEncoder] = None
+        self.ppnet: Optional[PPNet] = None
+        self.ppnet_context_cols: List[str] = []
+        self.ppnet_activity_dense_dim = 0
+        self.ppnet_activity_sparse_dim = 0
 
         # ── 1) 共享 video/author embedding（必须共享）──
         if mcfg.get("use_hash_embedding", True):
@@ -456,6 +467,8 @@ class DINModel(nn.Module):
         self.feature_block_dims = self._calc_feature_block_dims()
         self.feature_slices = build_feature_slices(self.feature_block_dims)
         self.head_input_dim = sum(self.feature_block_dims.values())
+        if self.ppnet_enabled:
+            self.personal_context_encoder = self._build_personal_context_encoder()
 
         # ── 11) 最终 head：mlp（基线）或 mbcnet（三分支）──
         self.dnn: Optional[nn.Module] = None
@@ -470,6 +483,20 @@ class DINModel(nn.Module):
                 feature_slices=self.feature_slices,
             )
             self.head = self.mbcnet_head
+
+        if self.ppnet_enabled:
+            if self.head_type != "mbcnet" and str(self.ppnet_cfg.get("apply_to", "head_input")).lower() in {
+                "mbcnet_branches",
+                "both",
+            }:
+                raise ValueError("PPNet branch gate 仅支持 head.type=mbcnet，请检查 ppnet.apply_to 配置。")
+            self.ppnet = PPNet(
+                context_dim=self.personal_context_encoder.output_dim if self.personal_context_encoder is not None else 0,
+                input_dim=self.head_input_dim,
+                config=self.ppnet_cfg,
+                feature_slices=self.feature_slices,
+                branch_names=self.mbcnet_head.enabled_branch_names if self.mbcnet_head is not None else None,
+            )
 
         logger.info(
             "模型变体: variant=%s | psrg=%s | pcrg=%s | fusion=%s | transformer=%s",
@@ -501,6 +528,15 @@ class DINModel(nn.Module):
                 self.mbcnet_head.fusion_mode,
                 [name for name, _ in self.mbcnet_head.group_slices],
             )
+        if self.ppnet_enabled and self.personal_context_encoder is not None and self.ppnet is not None:
+            logger.info(
+                "PPNet 配置: mode=%s | apply_to=%s | p_ctx_dim=%d | group_film=%s | branch_gate=%s",
+                self.ppnet.mode,
+                self.ppnet.apply_to,
+                self.personal_context_encoder.output_dim,
+                self.ppnet.group_film.group_names if self.ppnet.group_film is not None else [],
+                self.ppnet.branch_gate.branch_names if self.ppnet.branch_gate is not None else [],
+            )
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -525,6 +561,11 @@ class DINModel(nn.Module):
             logger.warning(message)
             self._warned_messages.add(key)
 
+    def _ensure_finite(self, tensor: torch.Tensor, name: str):
+        """模型内部的有限值检查，便于在调制阶段更早暴露异常。"""
+        if not torch.isfinite(tensor).all():
+            raise RuntimeError(f"检测到 NaN/Inf！位置: {name}")
+
     def _get_emb_dim(self, vocab_name: str) -> int:
         vs = self.vocab_sizes.get(vocab_name, 1)
         if vs > self.large_sparse_threshold:
@@ -542,6 +583,62 @@ class DINModel(nn.Module):
             return
         emb_dim = self._get_emb_dim(vocab_name)
         self.sparse_embeddings[col_name] = nn.Embedding(vs, emb_dim, padding_idx=0)
+
+    def _build_personal_context_encoder(self) -> PersonalContextEncoder:
+        """
+        初始化 p_ctx 编码器。
+
+        p_ctx = 场景信息 + 用户属性 + 活跃度代理
+        这样 PPNet 学到的是“在什么场景、对什么人、在什么活跃度状态下如何调制”，
+        而不是盲目地为每个样本生成重型参数。
+        """
+        self.ppnet_use_time_features = bool(self.ppnet_context_cfg.get("use_time_features", True))
+        self.ppnet_use_user_dense = bool(self.ppnet_context_cfg.get("use_user_dense", True))
+        self.ppnet_use_hist_len = bool(self.ppnet_context_cfg.get("use_hist_len", True))
+        self.ppnet_use_user_active_proxy = bool(self.ppnet_context_cfg.get("use_user_active_proxy", True))
+
+        self.ppnet_context_cols = ["tab"]
+        if self.ppnet_use_time_features:
+            for col_name in ["hour_of_day", "day_of_week", "is_weekend"]:
+                if col_name in self.context_sparse_cols and col_name not in self.ppnet_context_cols:
+                    self.ppnet_context_cols.append(col_name)
+
+        context_input_dim = 0
+        for col_name in self.ppnet_context_cols:
+            if col_name in self.sparse_embeddings:
+                context_input_dim += self.sparse_embeddings[col_name].embedding_dim
+
+        user_sparse_input_dim = 0
+        for col_name in self.user_sparse_cols:
+            if col_name in self.sparse_embeddings:
+                user_sparse_input_dim += self.sparse_embeddings[col_name].embedding_dim
+        user_dense_dim = len(self.user_dense_cols) if self.ppnet_use_user_dense else 0
+
+        self.ppnet_activity_dense_dim = 0
+        if self.ppnet_use_hist_len:
+            self.ppnet_activity_dense_dim += 1
+        if self.ppnet_use_user_active_proxy and "is_lowactive_period" in self.user_sparse_cols:
+            self.ppnet_activity_dense_dim += 1
+
+        self.ppnet_activity_sparse_dim = 0
+        if self.ppnet_use_user_active_proxy and "user_active_degree" in self.sparse_embeddings:
+            self.ppnet_activity_sparse_dim = self.sparse_embeddings["user_active_degree"].embedding_dim
+
+        if context_input_dim <= 0:
+            raise ValueError("PPNet 需要场景信息（至少 tab embedding），当前 context_input_dim=0。")
+        if (user_sparse_input_dim + user_dense_dim) <= 0:
+            raise ValueError("PPNet 需要用户属性输入，当前 user sparse + dense 维度都为 0。")
+        if (self.ppnet_activity_dense_dim + self.ppnet_activity_sparse_dim) <= 0:
+            raise ValueError("PPNet 需要活跃度代理输入，当前 activity 维度为 0。")
+
+        return PersonalContextEncoder(
+            context_input_dim=context_input_dim,
+            user_sparse_input_dim=user_sparse_input_dim,
+            user_dense_dim=user_dense_dim,
+            activity_dense_dim=self.ppnet_activity_dense_dim,
+            activity_sparse_dim=self.ppnet_activity_sparse_dim,
+            config=self.ppnet_context_cfg,
+        )
 
     def _base_interest_output_dim(self) -> int:
         if self.pcrg_enabled and self.fusion_mode == "concat" and not self.proj_after_concat:
@@ -666,6 +763,103 @@ class DINModel(nn.Module):
         )
         pad = ref.new_zeros((ref.shape[0], target_dim - cur_dim))
         return torch.cat([dense, pad], dim=-1)
+
+    def _build_activity_dense_feats(self, batch: Dict[str, torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+        """构造轻量活跃度代理特征。"""
+        target_dim = int(self.ppnet_activity_dense_dim)
+        if target_dim <= 0:
+            return ref.new_zeros((ref.shape[0], 0))
+
+        parts: List[torch.Tensor] = []
+        if getattr(self, "ppnet_use_hist_len", False):
+            if "hist_len" in batch:
+                hist_len = batch["hist_len"].float().view(-1, 1)
+                hist_len = torch.clamp(hist_len / max(self.max_hist_len, 1), 0.0, 1.0)
+                parts.append(hist_len)
+            else:
+                self._warn_once("ppnet_missing_hist_len", "PPNet 活跃度代理缺少 hist_len，将用 0 占位。")
+                parts.append(ref.new_zeros((ref.shape[0], 1)))
+
+        if getattr(self, "ppnet_use_user_active_proxy", False) and "is_lowactive_period" in self.user_sparse_cols:
+            if "is_lowactive_period" in batch:
+                lowactive = batch["is_lowactive_period"].float()
+                if lowactive.ndim == 1:
+                    lowactive = lowactive.unsqueeze(1)
+                else:
+                    lowactive = lowactive[:, :1]
+                parts.append(lowactive)
+            else:
+                self._warn_once(
+                    "ppnet_missing_is_lowactive_period",
+                    "PPNet 活跃度代理缺少 is_lowactive_period，将用 0 占位。",
+                )
+                parts.append(ref.new_zeros((ref.shape[0], 1)))
+
+        if not parts:
+            return ref.new_zeros((ref.shape[0], target_dim))
+
+        out = torch.cat(parts, dim=-1)
+        if out.shape[-1] == target_dim:
+            return out
+        if out.shape[-1] > target_dim:
+            return out[:, :target_dim]
+        pad = ref.new_zeros((ref.shape[0], target_dim - out.shape[-1]))
+        return torch.cat([out, pad], dim=-1)
+
+    def _build_activity_sparse_embs(self, batch: Dict[str, torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+        """构造活跃度相关的 sparse embedding 代理。"""
+        target_dim = int(self.ppnet_activity_sparse_dim)
+        if target_dim <= 0:
+            return ref.new_zeros((ref.shape[0], 0))
+
+        col_name = "user_active_degree"
+        if col_name in batch and col_name in self.sparse_embeddings:
+            return self.sparse_embeddings[col_name](batch[col_name])
+
+        self._warn_once(
+            "ppnet_missing_user_active_degree",
+            "PPNet 活跃度代理缺少 user_active_degree embedding，将用 0 占位。",
+        )
+        return ref.new_zeros((ref.shape[0], target_dim))
+
+    def _build_personal_context(
+        self,
+        batch: Dict[str, torch.Tensor],
+        ref: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """构造 PPNet 使用的 p_ctx。"""
+        if self.personal_context_encoder is None:
+            raise RuntimeError("PPNet 已启用，但 personal_context_encoder 尚未初始化。")
+
+        context_embs = self._collect_sparse_block(
+            batch=batch,
+            cols=self.ppnet_context_cols,
+            ref=ref,
+            block_name="ppnet_context_embs",
+        )
+        user_sparse_embs = self._collect_sparse_block(
+            batch=batch,
+            cols=self.user_sparse_cols,
+            ref=ref,
+            block_name="ppnet_user_sparse_embs",
+        )
+        user_dense = (
+            self._get_user_dense_fixed(batch, ref)
+            if getattr(self, "ppnet_use_user_dense", False)
+            else ref.new_zeros((ref.shape[0], 0))
+        )
+        activity_dense_feats = self._build_activity_dense_feats(batch, ref)
+        activity_sparse_embs = self._build_activity_sparse_embs(batch, ref)
+
+        p_ctx, stats = self.personal_context_encoder(
+            context_embs=context_embs,
+            user_sparse_embs=user_sparse_embs,
+            user_dense=user_dense,
+            activity_dense_feats=activity_dense_feats,
+            activity_sparse_embs=activity_sparse_embs,
+            return_debug=True,
+        )
+        return p_ctx, stats
 
     def _build_head_input(
         self,
@@ -880,6 +1074,8 @@ class DINModel(nn.Module):
         hist_mask = batch["hist_mask"].float()                       # [B, L]
         cand_item_repr = self._build_cand_item_repr(batch)            # [B, D]
         hist_item_repr = self._build_hist_item_repr(batch)            # [B, L, D]
+        self._ensure_finite(cand_item_repr, "cand_item_repr")
+        self._ensure_finite(hist_item_repr, "hist_item_repr")
 
         # d_ctx 仅在 PSRG/PCRG 路径需要时构建
         need_domain_ctx = self.psrg_enabled or self.pcrg_enabled
@@ -934,15 +1130,46 @@ class DINModel(nn.Module):
             )
             user_interest = self._fuse_transformer_interest(user_interest, u_fused)
 
+        p_ctx: Optional[torch.Tensor] = None
+        personal_ctx_stats: Dict[str, Any] = {}
+        ppnet_stats: Dict[str, Any] = {}
+        branch_gate: Optional[torch.Tensor] = None
+        if self.ppnet_enabled and self.ppnet is not None:
+            p_ctx, personal_ctx_stats = self._build_personal_context(batch=batch, ref=cand_item_repr)
+            self._ensure_finite(p_ctx, "p_ctx")
+
         # ── 统一 flat 向量 x，再送入可切换 head（MLP / MBCNet）──
         head_input = self._build_head_input(
             batch=batch,
             user_interest=user_interest,
             cand_item_repr=cand_item_repr,
         )
-        logits = self.head(head_input)
+        self._ensure_finite(head_input, "head_input_before_ppnet")
+
+        if self.ppnet_enabled and self.ppnet is not None and self.ppnet.apply_to in {"head_input", "both"}:
+            head_input, head_ppnet_stats = self.ppnet.modulate_head_input(
+                x=head_input,
+                p_ctx=p_ctx,
+                return_debug=True,
+            )
+            ppnet_stats.update(head_ppnet_stats)
+            self._ensure_finite(head_input, "head_input_after_ppnet")
+
+        if self.ppnet_enabled and self.ppnet is not None and self.ppnet.apply_to in {"mbcnet_branches", "both"}:
+            branch_gate, branch_ppnet_stats = self.ppnet.build_branch_gate(
+                p_ctx=p_ctx,
+                return_debug=True,
+            )
+            ppnet_stats.update(branch_ppnet_stats)
+            self._ensure_finite(branch_gate, "ppnet_branch_gate")
+
+        if self.head_type == "mbcnet" and self.mbcnet_head is not None:
+            logits = self.mbcnet_head(head_input, branch_gate=branch_gate)
+        else:
+            logits = self.head(head_input)
         if logits.ndim > 1:
             logits = logits.squeeze(-1)
+        self._ensure_finite(logits, "logits")
 
         # 记录调试统计，供 trainer 可选打印
         self._last_debug_stats = {
@@ -966,7 +1193,10 @@ class DINModel(nn.Module):
             "transformer_all_pad_count": int(
                 transformer_aux.get("target_all_pad_count", 0)
             ) if transformer_aux else 0,
+            "ppnet_enabled": self.ppnet_enabled,
         }
+        self._last_debug_stats.update(personal_ctx_stats)
+        self._last_debug_stats.update(ppnet_stats)
         if self.head_type == "mbcnet" and self.mbcnet_head is not None:
             self._last_debug_stats.update(self.mbcnet_head.last_debug_stats)
 
@@ -975,13 +1205,15 @@ class DINModel(nn.Module):
             self._printed_shape_once = True
             logger.info(
                 "[Debug Shapes] variant=%s | head=%s | cand_item=%s | hist_item=%s | "
-                "user_interest=%s | x=%s | logits=%s | slices=%s",
+                "user_interest=%s | p_ctx=%s | x=%s | branch_gate=%s | logits=%s | slices=%s",
                 self.variant,
                 self.head_type,
                 list(cand_item_repr.shape),
                 list(hist_for_attn.shape),
                 list(user_interest.shape),
+                list(p_ctx.shape) if p_ctx is not None else [],
                 list(head_input.shape),
+                list(branch_gate.shape) if branch_gate is not None else [],
                 list(logits.shape),
                 self.feature_slices,
             )

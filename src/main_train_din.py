@@ -96,6 +96,7 @@ def load_config(args) -> dict:
     config["model"].setdefault("psrg", {})
     config["model"].setdefault("pcrg", {})
     config["model"].setdefault("transformer_fusion", {})
+    config["model"].setdefault("ppnet", {})
 
     # CLI 覆盖
     if args.data_root:
@@ -367,6 +368,17 @@ def main():
         config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_lowrank_cross", "-"),
         config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_deep", "-"),
         config.get("model", {}).get("head", {}).get("mbcnet", {}).get("fusion", {}).get("mode", "-"),
+    )
+    logger.info(
+        "PPNet 配置: enabled=%s | mode=%s | apply_to=%s | use_time=%s | use_user_dense=%s | "
+        "use_hist_len=%s | use_user_active_proxy=%s",
+        config.get("model", {}).get("ppnet", {}).get("enabled", False),
+        config.get("model", {}).get("ppnet", {}).get("mode", "-"),
+        config.get("model", {}).get("ppnet", {}).get("apply_to", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_time_features", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_user_dense", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_hist_len", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_user_active_proxy", "-"),
     )
     logger.info("=" * 70)
 

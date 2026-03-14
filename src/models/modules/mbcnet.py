@@ -324,22 +324,38 @@ class MBCNetHead(nn.Module):
         if self.fusion_mode == "weighted_sum":
             # 学习三个分支（或当前启用分支）的权重。
             self.branch_weight_logits = nn.Parameter(torch.zeros(len(self.enabled_branch_names)))
-            fusion_input_dim = self.branch_proj_dim
         else:
-            fusion_input_dim = self.branch_proj_dim * len(self.enabled_branch_names)
+            self.branch_weight_logits = None
 
         fusion_dropout = float(self.fusion_cfg.get("dropout", 0.1))
         final_hidden = list(self.fusion_cfg.get("final_mlp", [128, 64]))
         final_act = str(self.fusion_cfg.get("activation", "relu"))
         self.fusion_dropout = nn.Dropout(fusion_dropout) if fusion_dropout > 0 else nn.Identity()
-        self.fusion_mlp, final_dim = _build_mlp(
-            input_dim=fusion_input_dim,
+
+        # vector head 用于：
+        # 1) baseline weighted_sum
+        # 2) PPNet branch gate 的加权融合
+        self.vector_fusion_mlp, vector_final_dim = _build_mlp(
+            input_dim=self.branch_proj_dim,
             hidden_units=final_hidden,
             activation=final_act,
             dropout=fusion_dropout,
             use_layernorm=False,
         )
-        self.out_linear = nn.Linear(final_dim, 1)
+        self.vector_out_linear = nn.Linear(vector_final_dim, 1)
+
+        self.concat_fusion_mlp: Optional[nn.Module] = None
+        self.concat_out_linear: Optional[nn.Linear] = None
+        if self.fusion_mode == "concat_then_mlp":
+            concat_input_dim = self.branch_proj_dim * len(self.enabled_branch_names)
+            self.concat_fusion_mlp, concat_final_dim = _build_mlp(
+                input_dim=concat_input_dim,
+                hidden_units=final_hidden,
+                activation=final_act,
+                dropout=fusion_dropout,
+                use_layernorm=False,
+            )
+            self.concat_out_linear = nn.Linear(concat_final_dim, 1)
 
         self.last_debug_stats: Dict[str, Any] = {}
 
@@ -353,13 +369,22 @@ class MBCNetHead(nn.Module):
             outs["deep"] = self.deep_branch(x)
         return outs
 
+    def _project_branches(self, raw_outs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {
+            name: self.branch_projectors[name](raw_outs[name])
+            for name in self.enabled_branch_names
+        }
+
     def _collect_debug_stats(
         self,
         raw_outs: Dict[str, torch.Tensor],
         weights: Optional[torch.Tensor] = None,
+        branch_gate: Optional[torch.Tensor] = None,
+        fusion_source: str = "baseline",
     ) -> Dict[str, Any]:
         stats: Dict[str, Any] = {
             "mbcnet_enabled_branches": ",".join(self.enabled_branch_names),
+            "mbcnet_fusion_source": fusion_source,
         }
         for name, tensor in raw_outs.items():
             norm_mean = tensor.norm(dim=-1).mean().detach().cpu().item()
@@ -370,9 +395,31 @@ class MBCNetHead(nn.Module):
             stats["mbcnet_branch_weights"] = weight_list
             for name, value in zip(self.enabled_branch_names, weight_list):
                 stats[f"mbcnet_weight_{name}"] = value
+
+        if branch_gate is not None:
+            gate_mean = branch_gate.mean(dim=0).detach().cpu().tolist()
+            stats["mbcnet_branch_gate_mean"] = [float(x) for x in gate_mean]
+            for name, value in zip(self.enabled_branch_names, gate_mean):
+                stats[f"mbcnet_gate_{name}"] = float(value)
         return stats
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _run_vector_head(self, fused: torch.Tensor) -> torch.Tensor:
+        fused = self.fusion_dropout(fused)
+        fused = self.vector_fusion_mlp(fused)
+        return self.vector_out_linear(fused).squeeze(-1)
+
+    def _run_concat_head(self, fused: torch.Tensor) -> torch.Tensor:
+        if self.concat_fusion_mlp is None or self.concat_out_linear is None:
+            raise RuntimeError("当前 MBCNet 未构建 concat_then_mlp 融合头。")
+        fused = self.fusion_dropout(fused)
+        fused = self.concat_fusion_mlp(fused)
+        return self.concat_out_linear(fused).squeeze(-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        branch_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if x.ndim != 2:
             raise ValueError(f"MBCNetHead 输入必须是 [B,D]，当前={list(x.shape)}")
         if x.shape[-1] != self.input_dim:
@@ -381,28 +428,40 @@ class MBCNetHead(nn.Module):
             )
 
         raw_outs = self._forward_branches(x)
-        proj_outs = {
-            name: self.branch_projectors[name](raw_outs[name])
-            for name in self.enabled_branch_names
-        }
+        proj_outs = self._project_branches(raw_outs)
 
         weights: Optional[torch.Tensor] = None
-        if self.fusion_mode == "weighted_sum":
+        fusion_source = "baseline"
+        if branch_gate is not None:
+            if branch_gate.ndim != 2:
+                raise ValueError(f"branch_gate 必须是 [B,N]，当前={list(branch_gate.shape)}")
+            expected_shape = (x.shape[0], len(self.enabled_branch_names))
+            if tuple(branch_gate.shape) != expected_shape:
+                raise ValueError(
+                    f"branch_gate shape 不匹配，预期={list(expected_shape)}，实际={list(branch_gate.shape)}"
+                )
+            stacked = torch.stack([proj_outs[name] for name in self.enabled_branch_names], dim=1)  # [B,N,D]
+            fused = (stacked * branch_gate.unsqueeze(-1)).sum(dim=1)
+            logit = self._run_vector_head(fused)
+            fusion_source = "ppnet_branch_gate"
+        elif self.fusion_mode == "weighted_sum":
             weights = torch.softmax(self.branch_weight_logits, dim=0)  # [N]
             stacked = torch.stack([proj_outs[name] for name in self.enabled_branch_names], dim=1)  # [B,N,D]
             fused = (stacked * weights.view(1, -1, 1)).sum(dim=1)
+            logit = self._run_vector_head(fused)
         else:
             fused = torch.cat([proj_outs[name] for name in self.enabled_branch_names], dim=-1)
+            logit = self._run_concat_head(fused)
 
-        fused = self.fusion_dropout(fused)
-        fused = self.fusion_mlp(fused)
-        logit = self.out_linear(fused).squeeze(-1)
-
-        self.last_debug_stats = self._collect_debug_stats(raw_outs, weights=weights)
+        self.last_debug_stats = self._collect_debug_stats(
+            raw_outs,
+            weights=weights,
+            branch_gate=branch_gate,
+            fusion_source=fusion_source,
+        )
         return logit
 
     def get_and_reset_debug_stats(self) -> Dict[str, Any]:
         stats = self.last_debug_stats
         self.last_debug_stats = {}
         return stats
-

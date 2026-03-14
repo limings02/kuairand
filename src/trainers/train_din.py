@@ -169,6 +169,22 @@ def train_one_epoch(
                             float(debug_stats.get("mbcnet_deep_norm_mean", 0.0)),
                             debug_stats.get("mbcnet_branch_weights", []),
                         )
+                    if debug_stats.get("ppnet_enabled", False):
+                        logger.info(
+                            "PPNet Debug | apply_to=%s | mode=%s | p_ctx_dim=%s | "
+                            "gamma(mean/var)=%.6f/%.6f | beta(mean/var)=%.6f/%.6f | "
+                            "gate_mean=%s | x_norm(before/after)=%.6f/%.6f",
+                            debug_stats.get("ppnet_apply_to", "-"),
+                            debug_stats.get("ppnet_mode", "-"),
+                            debug_stats.get("personal_context_output_dim", 0),
+                            float(debug_stats.get("ppnet_gamma_mean", 0.0)),
+                            float(debug_stats.get("ppnet_gamma_var", 0.0)),
+                            float(debug_stats.get("ppnet_beta_mean", 0.0)),
+                            float(debug_stats.get("ppnet_beta_var", 0.0)),
+                            debug_stats.get("ppnet_branch_gate_mean", []),
+                            float(debug_stats.get("ppnet_x_norm_before_mean", 0.0)),
+                            float(debug_stats.get("ppnet_x_norm_after_mean", 0.0)),
+                        )
 
         step_loss = loss.item() * accum_steps
         running_loss += step_loss
